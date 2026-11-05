@@ -350,13 +350,13 @@ _PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 :root[data-theme="dark"]{--ink:#E8EEF6;--muted:#A9B7C8;--faint:#7D8FA3;--card:#18222F;--line:#2A3747;--bg:#0F1722;--ghost:#3C5A80;--code:#141D29}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font-family:Aptos,"Segoe UI",Inter,system-ui,-apple-system,sans-serif;font-size:14px}
-.wrap{max-width:1260px;margin:0 auto;padding:20px 16px 32px}
+.wrap{margin:0 auto;padding:20px 28px 32px}
 h1{font-size:24px;margin:0 0 12px;font-weight:700}
 .presets{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px}
 .presets button,.btn{font:inherit;font-size:13px;border:1px solid var(--line);background:var(--card);color:var(--ink);
 border-radius:8px;padding:6px 12px;cursor:pointer}
 .presets button.on{background:var(--accent);border-color:var(--accent);color:#fff}
-.main{display:grid;grid-template-columns:340px 1fr;gap:16px;align-items:start}
+.main{display:grid;grid-template-columns:360px 1fr;gap:18px;align-items:start}
 @media(max-width:860px){.main{grid-template-columns:1fr}}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;min-width:0}
 .card h2{font-size:15px;margin:0 0 4px}
@@ -367,11 +367,12 @@ input.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.row3{display:grid;grid-template-columns:1.3fr 1fr;gap:8px}
 .help{color:var(--faint);font-size:11.5px;margin:2px 0 0}
 .err{color:var(--comm);font-size:12.5px;min-height:18px;margin-top:8px}
-.tabs{display:flex;gap:4px;margin:14px 0 0;border-bottom:1px solid var(--line)}
-.tabs button{font:inherit;font-size:12.5px;border:0;background:none;color:var(--muted);padding:6px 10px;cursor:pointer;border-bottom:2px solid transparent}
+.tabs{display:flex;gap:4px;margin:0;border-bottom:1px solid var(--line)}
+.tabs button{font:inherit;font-size:14px;border:0;background:none;color:var(--muted);padding:6px 10px;cursor:pointer;border-bottom:2px solid transparent}
 .tabs button.on{color:var(--ink);border-bottom-color:var(--accent)}
 pre{background:var(--code);border:1px solid var(--line);border-top:0;border-radius:0 0 8px 8px;margin:0;padding:10px 12px;
-font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre;max-height:360px;overflow:auto}
+font:14px/1.55 ui-monospace,Menlo,Consolas,monospace;white-space:pre;max-height:560px;overflow:auto}
+.codecard{margin-top:18px}
 .note{color:var(--muted);font-size:13px;margin:0 0 10px}
 .formula{font:12.5px ui-monospace,Menlo,Consolas,monospace;color:var(--muted);min-height:20px;margin:8px 0 0}
 .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px}
@@ -386,23 +387,23 @@ svg text{font-family:Aptos,"Segoe UI",Inter,system-ui,sans-serif}
  <div class="card">
   <h2>Layout</h2>
   <div class="row"><div><label>Tensor shape</label><input id="shape"></div><div><label>PE grid</label><input id="grid"></div></div>
-  <h3>① Cut</h3><p class="help">How each tensor axis is cut into pieces. Pieces get coordinates t0, t1, …</p>
+  <h3>① Decomposition layout</h3>
   <div id="cuts"></div>
-  <h3>③ Map</h3><p class="help">Grid coordinate of each piece: an expression in t0, t1, … with + − * floordiv mod. Blank = replicated.</p>
+  <h3>③ Mapping layout</h3>
   <div id="maps"></div>
   <div class="row"><div><label>Halo radius</label><input id="halo" type="number" min="0" value="0"></div>
    <div><label>Bytes / element · PE KiB</label><div class="row"><input id="bytes" type="number" min="1"><input id="kib" type="number" min="1"></div></div></div>
   <div class="err" id="err"></div>
-  <div class="tabs" id="tabs"></div><pre id="code"></pre>
  </div>
  <div class="card">
-  <p class="note" id="note"></p>
   <div id="pic"></div>
   <div class="formula" id="formula"></div>
   <div class="legend" id="legend"></div>
   <div class="bar"><button class="btn" id="pin">Pin as A</button><button class="btn" id="svg">Export SVG</button><span class="stat" id="stat"></span></div>
  </div>
-</div></div>
+</div>
+<div class="card codecard"><div class="tabs" id="tabs"></div><pre id="code"></pre></div>
+</div>
 <script>
 const PRESETS=%PRESETS%, COLORS=%COLORS%;
 const $=id=>document.getElementById(id);
@@ -436,7 +437,8 @@ function strE(e){switch(e.t){case"var":return "t"+e.k;case"con":return String(e.
 function sizesOf(c,extent){const parts=c.parts;
   if(!(parts>=1))throw new Error(`axis ${c.axis}: needs at least 1 piece`);
   if(c.kind==="block"){if(extent%parts)throw new Error(`axis ${c.axis} of ${extent} is not divisible into ${parts} blocks (${extent} % ${parts} = ${extent%parts}); choose uneven`);return Array(parts).fill(extent/parts)}
-  if(c.sizes){const s=c.sizes.reduce((a,b)=>a+b,0);if(s!==extent||c.sizes.length!==parts)throw new Error(`uneven sizes [${c.sizes}] must be ${parts} parts summing to ${extent}`);return c.sizes.slice()}
+  if(c.sizes){const s=c.sizes.reduce((a,b)=>a+b,0);if(c.sizes.some(v=>!(v>=1)||!Number.isInteger(v)))throw new Error(`axis ${c.axis}: sizes must be positive integers`);
+    if(s!==extent)throw new Error(`axis ${c.axis}: sizes ${c.sizes.join(", ")} sum to ${s}, axis has ${extent}`);return c.sizes.slice()}
   if((c.policy||"balanced")==="balanced"){const q=Math.floor(extent/parts),r=extent%parts;return Array.from({length:parts},(_,k)=>k<r?q+1:q)}
   const b=Math.ceil(extent/parts);let left=extent;return Array.from({length:parts},()=>{const v=Math.min(b,left);left-=v;return v})}
 function prod(lists){return lists.reduce((acc,l)=>acc.flatMap(a=>l.map(x=>a.concat([x]))),[[]])}
@@ -544,57 +546,50 @@ function formula(L,idx){
   const pe=L.primaryOf(pid), hs=L.holdersOf(pid);
   return `element (${idx.join(", ")}): ${cut.join("; ")||"one piece"} → ${pname(pid)} → ${map.join("; ")||"(replicated)"} → PE ${L.peIx(pe)}`+(hs.length>1?`, held by ${hs.length} PEs`:"");
 }
-function hint(L){
-  const cut=L.rules.map((r,k)=>r.c.kind==="block"?`t${k} = i${r.axis} // ${r.sizes[0]}`:`t${k} from sizes [${brief(r.sizes)}]`).join(", ");
-  const map=L.table?`owner table over ${L.table.length} runs`:L.exprs.map((e,g)=>e?`g${g} = ${strE(e)}`:null).filter(Boolean).join(", ");
-  const rr=L.replicate.filter(g=>L.grid[g]>1);
-  return `hover an element · cut: ${cut||"none"} · map: ${map||"none"}`+(rr.length?` · replicated over ${rr.map(g=>"g"+g).join(", ")}`:"");
-}
+function hint(L){return ""}
+
 function fmtB(b){return b>=1024?(b/1024).toFixed(b%1024?1:0)+" KiB":b+" B"}
 
 // ---------- drawing (SVG) ----------
 function draw(L){
-  const W=Math.min(880,$("pic").clientWidth||880), h=+L.spec.halo||0, bytes=+L.spec.bytes||4, budget=(+L.spec.kib||48)*1024;
+  const W=Math.min(1600,$("pic").clientWidth||1100), h=+L.spec.halo||0, bytes=+L.spec.bytes||4, budget=(+L.spec.kib||48)*1024;
   const rank=L.shape.length, ink="var(--ink)", muted="var(--muted)";
   const cap=(x,y,t)=>`<text x="${x}" y="${y}" font-size="12" font-weight="600" fill="${ink}">${t}</text>`;
   const sub=(x,y,t)=>`<text x="${x}" y="${y}" font-size="11.5" fill="${muted}">${t}</text>`;
   let s="";
-  // ① the cutter
-  const TW=Math.max(150,Math.min(220,Math.floor(W*0.25))), ty0=30;
-  let tw0,th0,toScale=true;
-  if(rank===1){tw0=TW;th0=34}else{const sc0=Math.min(TW/L.shape[1],150/L.shape[0]);tw0=L.shape[1]*sc0;th0=L.shape[0]*sc0;
-    if(tw0<TW*0.3||th0<44){toScale=false;tw0=Math.max(tw0,TW*0.45);th0=Math.max(th0,Math.min(150,18*Math.max(2,...L.rules.filter(r=>r.axis===0).map(r=>r.sizes.length))))}}
-  const fx=v=>v/(rank===1?L.shape[0]:L.shape[1])*tw0, fy=v=>rank===1?0:v/L.shape[0]*th0;
-  s+=cap(0,14,"① Cut")+`<rect x="0.5" y="${ty0+.5}" width="${tw0}" height="${th0}" fill="var(--bg)" stroke="${ink}" stroke-width="1.2" rx="3"/>`;
-  L.rules.forEach(r=>{const dense=r.sizes.length>48;r.starts.slice(1,-1).forEach(v=>{
-    if(rank===1||r.axis===1){const x=fx(v)+.5;s+=`<line x1="${x}" y1="${ty0}" x2="${x}" y2="${ty0+th0}" stroke="${ink}" stroke-width="${dense?.6:1.4}" stroke-dasharray="${dense?"2 2":"5 3"}"/>`}
-    else{const y=ty0+fy(v)+.5;s+=`<line x1="0" y1="${y}" x2="${tw0}" y2="${y}" stroke="${ink}" stroke-width="${dense?.6:1.4}" stroke-dasharray="${dense?"2 2":"5 3"}"/>`}})});
-  L.pids.forEach(pid=>{const r=L.region(pid);const x1=fx(rank===1?r.lo[0]:r.lo[1]),x2=fx(rank===1?r.hi[0]:r.hi[1]),y1=rank===1?0:fy(r.lo[0]),y2=rank===1?th0:fy(r.hi[0]);
-    const lab=pname(pid);if(x2-x1>=lab.length*6.5&&y2-y1>=14)s+=`<text x="${(x1+x2)/2}" y="${ty0+(y1+y2)/2+4}" font-size="11" fill="${muted}" text-anchor="middle">${lab}</text>`});
-  const rulesTxt=L.rules.length?L.rules.map((r,k)=>r.c.sizes&&r.c.sizes.length>12?`t${k}: UnevenBlock(axis=${r.axis}, ${r.c.sizes.length} runs)`:`t${k}: ${ruleRepr(r)}`):["no cut: one piece"];
-  if(!toScale)rulesTxt.push("(not to scale)");
-  rulesTxt.forEach((t,k)=>s+=sub(0,ty0+th0+18+k*15,t));
-  const tBottom=ty0+th0+18+(rulesTxt.length-1)*15;
-  // ② the tensor: same cuts, colored by the owner PE of each piece
-  const X0=TW+46, AW=W-X0;
+  // the tensor's drawing grid (1-D tensors wrap into rows); the decomposition layout uses the same grid
   let rows,cols,at0;
   if(rank===1){const n=L.shape[0],b=L.rules.length?Math.max(...L.rules[0].sizes):n;const w=(b>=4&&b<=64)?b:b>64?64:Math.min(n,32);cols=Math.min(n,w);rows=Math.ceil(n/cols);at0=(r,c)=>r*cols+c<n?[r*cols+c]:null}
   else{rows=L.shape[0];cols=L.shape[1];at0=(r,c)=>[r,c]}
   const sr=Math.ceil(rows/48), sc=Math.ceil(cols/64), at=(r,c)=>at0(r*sr,c*sc);
   rows=Math.ceil(rows/sr);cols=Math.ceil(cols/sc);
-  const cs=Math.max(4,Math.min(26,Math.floor(AW/cols)-2)), gap=cs>8?2:1, step=cs+gap, tw=cols*step, th=rows*step;
-  s+=`<path d="M${TW+10},${ty0+th0/2} h22" stroke="${muted}" stroke-width="1.5" marker-end="url(#ahm)"/>`;
-  s+=cap(X0,14,`② Tensor ${L.shape.join(" × ")}, colored by owner PE`)+sub(X0+300,14,sr>1||sc>1?`showing every ${rank===1?sr*sc:[sr,sc].join(" × ")}th element`:"");
-  const y0=ty0, pidAt=[], box={};
+  const pidAt=[], bc={};
   for(let r=0;r<rows;r++){pidAt.push([]);for(let c=0;c<cols;c++){const idx=at(r,c);if(!idx){pidAt[r].push(-1);continue}
-    const pid=L.partOf(idx),pi=L.pidIx(pid),own=L.peIx(L.primaryOf(pid));pidAt[r].push(pi);
+    const pi=L.pidIx(L.partOf(idx));pidAt[r].push(pi);const q=bc[pi]=bc[pi]||[c,r,c+1,r+1];q[0]=Math.min(q[0],c);q[1]=Math.min(q[1],r);q[2]=Math.max(q[2],c+1);q[3]=Math.max(q[3],r+1)}}
+  const cutPath=(x0,y0,sx,sy,gap)=>{let d="";for(let r=0;r<rows;r++)for(let c=0;c<cols;c++){const p0=pidAt[r][c];if(p0<0)continue;
+    if(c+1<cols&&pidAt[r][c+1]>=0&&pidAt[r][c+1]!==p0){const x=x0+(c+1)*sx-gap/2;d+=`M${x},${y0+r*sy-gap/2}v${sy}`}
+    if(r+1<rows&&pidAt[r+1][c]>=0&&pidAt[r+1][c]!==p0){const y=y0+(r+1)*sy-gap/2;d+=`M${x0+c*sx-gap/2},${y}h${sx}`}}return d};
+  // ① decomposition layout: a scaled outline of the tensor with the cut lines, so it can be laid on the tensor
+  const ty0=30, cc=Math.max(2,Math.min(18,Math.floor(320/cols),Math.floor(220/rows)));
+  const ch=rank===1?Math.max(cc,Math.min(28,Math.floor(160/rows))):cc, tw0=cols*cc, th0=rows*ch;   // 1-D rows are not a real aspect: give them room
+  s+=cap(0,14,"① Decomposition layout")+`<rect x="0.5" y="${ty0+.5}" width="${tw0}" height="${th0}" fill="var(--bg)" stroke="${ink}" stroke-width="1.2" rx="3"/>`;
+  s+=`<path d="${cutPath(.5,ty0+.5,cc,ch,0)}" fill="none" stroke="${ink}" stroke-width="${cc>=6?1.4:.8}" stroke-dasharray="${cc>=6?"5 3":"2 2"}"/>`;
+  Object.entries(bc).forEach(([pi,[c0,r0,c1,r1]])=>{const lab=pname(L.pids[+pi]);
+    const fs=(r1-r0)*ch>=16?11:9.5;if((c1-c0)*cc>=lab.length*fs*0.62+4&&(r1-r0)*ch>=12)s+=`<text x="${(c0+c1)/2*cc}" y="${ty0+(r0+r1)/2*ch+fs*0.36}" font-size="${fs}" fill="${muted}" text-anchor="middle">${lab}</text>`});
+  const rulesTxt=L.rules.length?L.rules.map((r,k)=>r.c.sizes&&r.c.sizes.length>12?`t${k}: UnevenBlock(axis=${r.axis}, ${r.c.sizes.length} runs)`:`t${k}: ${ruleRepr(r)}`):["one piece"];
+  rulesTxt.forEach((t,k)=>s+=sub(0,ty0+th0+18+k*15,t));
+  const tBottom=ty0+th0+18+(rulesTxt.length-1)*15;
+  // ② the tensor: same cuts, colored by the owner PE of each piece; kept well apart from ①
+  const TW=Math.max(tw0,200), X0=TW+130, AW=W-X0;
+  const cs=Math.max(4,Math.min(30,Math.floor(AW/cols)-2)), gap=cs>8?2:1, step=cs+gap, tw=cols*step, th=rows*step;
+  const y0=ty0, box={};
+  s+=`<path d="M${tw0+28},${ty0+Math.min(th0,th)/2} H${X0-28}" stroke="${muted}" stroke-width="1.5" marker-end="url(#ahm)"/>`;
+  s+=cap(X0,14,`② Tensor ${L.shape.join(" × ")}`)+(sr>1||sc>1?sub(X0+150,14,`sampled 1/${rank===1?sr*sc:[sr,sc].join(" × 1/")}`):"");
+  for(let r=0;r<rows;r++)for(let c=0;c<cols;c++){const idx=at(r,c);if(!idx)continue;
+    const pid=L.partOf(idx),pi=pidAt[r][c],own=L.peIx(L.primaryOf(pid));
     const x=X0+c*step,y=y0+r*step;const bb=box[pi]=box[pi]||[x,y,x,y];bb[0]=Math.min(bb[0],x);bb[1]=Math.min(bb[1],y);bb[2]=Math.max(bb[2],x+cs);bb[3]=Math.max(bb[3],y+cs);
-    s+=`<rect class="el" data-i="${idx}" data-o="${own}" x="${x}" y="${y}" width="${cs}" height="${cs}" rx="${cs>10?3:1}" fill="${peColor(L,own)}"/>`}}
-  let cuts="";
-  for(let r=0;r<rows;r++)for(let c=0;c<cols;c++){const p0=pidAt[r][c];if(p0<0)continue;
-    if(c+1<cols&&pidAt[r][c+1]>=0&&pidAt[r][c+1]!==p0){const x=X0+(c+1)*step-gap/2;cuts+=`M${x},${y0+r*step-gap/2}v${step}`}
-    if(r+1<rows&&pidAt[r+1][c]>=0&&pidAt[r+1][c]!==p0){const y=y0+(r+1)*step-gap/2;cuts+=`M${X0+c*step-gap/2},${y}h${step}`}}
-  if(cs>=8)s+=`<path d="${cuts}" fill="none" stroke="${ink}" stroke-width="1.4" stroke-dasharray="5 3" pointer-events="none"/>`;
+    s+=`<rect class="el" data-i="${idx}" data-o="${own}" x="${x}" y="${y}" width="${cs}" height="${cs}" rx="${cs>10?3:1}" fill="${peColor(L,own)}"/>`}
+  if(cs>=8)s+=`<path d="${cutPath(X0,y0,step,step,gap)}" fill="none" stroke="${ink}" stroke-width="1.4" stroke-dasharray="5 3" pointer-events="none"/>`;
   Object.entries(box).forEach(([pi,[x1,y1,x2,y2]])=>{const lab=pname(L.pids[+pi]),lw=lab.length*7+10;if(x2-x1>=lw+4&&y2-y1>=16){
     const cx=(x1+x2)/2,cy=(y1+y2)/2;
     s+=`<g pointer-events="none"><rect x="${cx-lw/2}" y="${cy-9}" width="${lw}" height="18" rx="9" fill="rgba(23,37,60,.78)"/><text x="${cx}" y="${cy+4}" font-size="11.5" font-weight="700" fill="#fff" text-anchor="middle">${lab}</text></g>`}});
@@ -602,7 +597,7 @@ function draw(L){
   const G=L.grid, gr=G.length>1?G.slice(0,-1).reduce((a,b)=>a*b,1):1, gc=G[G.length-1], halo=h&&L.maxPieces<=1;
   const bw=Math.max(104,Math.min(160,Math.floor((W-8)/gc)-12)), bh=58, bg=halo?34:12, py=Math.max(y0+th,tBottom)+48;
   const rr=L.replicate.filter(g=>L.grid[g]>1);
-  s+=cap(0,py-14,`③ Map: grid ${G.join(" × ")}`)+sub(150,py-14,`pieces held, memory used${halo?` (with halo ${h})`:h?" (halo shown for one-piece PEs only)":""}${rr.length?`; replicated over ${rr.map(g=>"g"+g).join(", ")}`:""}`);
+  s+=cap(0,py-14,`③ Mapping layout · grid ${G.join(" × ")}`)+sub(220,py-14,[halo?`halo ${h}`:"",rr.length?`replicated over ${rr.map(g=>"g"+g).join(", ")}`:""].filter(Boolean).join(" · "));
   const pos={};let maxB=0,over=0;
   L.pes.forEach(pe=>{const i=L.peIx(pe),row=G.length>1?Math.floor(i/gc):0,col=i%gc,x=col*(bw+bg),y=py+row*(bh+bg);pos[i]=[x+bw/2,y+bh/2];
     const gh=L.spec.ghosts?L.spec.ghosts[i]:0;
@@ -637,7 +632,7 @@ function draw(L){
     const own=P.map((_,id)=>L.peIx(L.primaryOf(L.partOf([id])))),X=id=>10+P[id][1]*sp,Y=id=>gy+P[id][0]*sp;
     let cutN=0,es="";gv.edges.forEach(([u,v])=>{const cut=own[u]!==own[v];if(cut)cutN++;
       es+=`<line x1="${X(u)}" y1="${Y(u)}" x2="${X(v)}" y2="${Y(v)}" stroke="${cut?"#D95455":"var(--line)"}" stroke-width="${cut?1.6:1.2}" ${cut?'stroke-dasharray="4 3"':""}/>`});
-    s+=cap(0,gy-24,"④ Graph: each id at its mesh position, colored by owner")+sub(330,gy-24,`dashed red = cut edges (${cutN}): every one is a ghost read`)+es;
+    s+=cap(0,gy-24,"④ Graph")+sub(80,gy-24,`${cutN} cut edges`)+es;
     P.forEach((_,id)=>{s+=`<circle class="el" data-i="${id}" data-o="${own[id]}" cx="${X(id)}" cy="${Y(id)}" r="${Math.max(4,sp*0.28)}" fill="${peColor(L,own[id])}" stroke="var(--bg)" stroke-width="1.2"><title>id ${id} → PE ${own[id]}</title></circle>`});
     H=gy+mx*sp+20;PW=Math.max(PW,20+my*sp)}
   const mk=(id,d,rx)=>`<marker id="${id}" viewBox="0 0 10 10" refX="${rx}" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="${d}" fill="${id==="ahm"?"#52657B":"#D95455"}"/></marker>`;
@@ -663,19 +658,27 @@ function syncForm(){
   const box=$("cuts");box.innerHTML="";
   cur.shape.forEach((n,a)=>{const c=cur.cuts.find(c=>c.axis===a),kind=c?c.kind:"whole";
     box.insertAdjacentHTML("beforeend",`<div class="row3"><div><label>Tensor axis ${a} (${n})</label><select data-a="${a}">${["whole","block","uneven"].map(k=>`<option ${k===kind?"selected":""}>${k}</option>`).join("")}</select></div>`+
-      `<div><label>pieces</label><input type="number" min="1" data-p="${a}" value="${c?c.parts:1}" ${c?"":"disabled"}></div></div>`)});
+      `<div><label>pieces</label><input type="number" min="1" data-p="${a}" value="${c?c.parts:1}" ${c?"":"disabled"}></div></div>`+
+      (kind==="uneven"?`<div class="row3"><div><label>sizes</label><input class="mono" data-s="${a}" placeholder="e.g. 3, 7" value="${c&&c.sizes?c.sizes.join(", "):""}"></div>`+
+        `<div><label>policy</label><select data-pol="${a}" ${c&&c.sizes?"disabled":""}>${["balanced","tail"].map(k=>`<option ${k===(c.policy||"balanced")?"selected":""}>${k}</option>`).join("")}</select></div></div>`:""))});
   box.querySelectorAll("select").forEach(sel=>sel.onchange=()=>{const a=+sel.dataset.a,k=sel.value;cur.cuts=cur.cuts.filter(c=>c.axis!==a);
     if(k!=="whole"){const ncut=cur.cuts.length;cur.cuts.push({axis:a,kind:k,parts:cur.grid[Math.min(ncut,cur.grid.length-1)]||2,policy:"balanced"});cur.cuts.sort((x,y)=>x.axis-y.axis);
       const k2=cur.cuts.findIndex(c=>c.axis===a),g=Math.min(k2,cur.grid.length-1);if(!(cur.map[g]||"").trim())cur.map[g]="t"+k2}
     delete cur.mlir;delete cur.air;delete cur.imports;delete cur.ghosts;syncForm();render()});
-  box.querySelectorAll("input").forEach(inp=>inp.oninput=()=>{const c=cur.cuts.find(c=>c.axis===+inp.dataset.p);if(c){c.parts=+inp.value;delete c.sizes;delete cur.mlir;delete cur.air;render()}});
+  box.querySelectorAll("input[data-p]").forEach(inp=>inp.oninput=()=>{const c=cur.cuts.find(c=>c.axis===+inp.dataset.p);if(c){c.parts=+inp.value;delete c.sizes;
+    const si=box.querySelector(`input[data-s="${c.axis}"]`);if(si)si.value="";const ps=box.querySelector(`select[data-pol="${c.axis}"]`);if(ps)ps.disabled=false;delete cur.mlir;delete cur.air;render()}});
+  box.querySelectorAll("input[data-s]").forEach(inp=>inp.oninput=()=>{const c=cur.cuts.find(c=>c.axis===+inp.dataset.s);if(!c)return;
+    const v=inp.value.split(/[,\s]+/).filter(Boolean).map(Number);const ps=box.querySelector(`select[data-pol="${c.axis}"]`);
+    if(v.length){c.sizes=v;c.parts=v.length;const pi=box.querySelector(`input[data-p="${c.axis}"]`);if(pi)pi.value=v.length;if(ps)ps.disabled=true}else{delete c.sizes;if(ps)ps.disabled=false}
+    delete cur.mlir;delete cur.air;render()});
+  box.querySelectorAll("select[data-pol]").forEach(sel=>sel.onchange=()=>{const c=cur.cuts.find(c=>c.axis===+sel.dataset.pol);if(c){c.policy=sel.value;delete cur.mlir;delete cur.air;render()}});
   const mb=$("maps");mb.innerHTML="";
-  if(cur.table){mb.innerHTML=`<p class="help">Owner table (irregular): piece k → PE table[k], from <code>owner_array(owner)</code> in Python. ${cur.table.length} runs.</p>`;return}
+  if(cur.table){mb.innerHTML=`<label>Owner table: ${cur.table.length} runs</label>`;return}
   cur.grid.forEach((n,g)=>mb.insertAdjacentHTML("beforeend",`<label>Grid axis g${g} (${n} PEs)</label><input class="mono" data-g="${g}" value="${(cur.map[g]||"").replace(/"/g,"&quot;")}" placeholder="replicated">`));
   mb.querySelectorAll("input").forEach(inp=>inp.oninput=()=>{cur.map[+inp.dataset.g]=inp.value;delete cur.mlir;delete cur.air;render()});
 }
 function load(spec){cur=JSON.parse(JSON.stringify(spec));$("shape").value=cur.shape.join(" × ");$("grid").value=cur.grid.join(" × ");
-  $("halo").value=cur.halo||0;$("bytes").value=cur.bytes||4;$("kib").value=cur.kib||48;$("note").textContent=cur.note||"";syncForm();render()}
+  $("halo").value=cur.halo||0;$("bytes").value=cur.bytes||4;$("kib").value=cur.kib||48;syncForm();render()}
 function render(){
   try{const L=build(cur);$("err").textContent="";draw(L);showCode(L);window.__last=L}
   catch(e){$("err").textContent=e.message}}
