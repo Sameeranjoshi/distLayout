@@ -81,11 +81,11 @@ def presets():
     ]
 
 
-def copy_mlir(view):
+def copy_mlir(view, halo=0):
     """Real MLIR of the layout's scatter/gather kernel, when MLIR-AIR is installed and the layout emits."""
     try:
         from distlayout.backends import air as air_backend
-        return str(air_backend.copy_kernel(view).build(target="npu2"))
+        return str(air_backend.copy_kernel(view, halo=halo).build(target="npu2"))
     except ImportError:
         return None
     except NotImplementedError as e:
@@ -99,7 +99,7 @@ def main(out):
     for name, view, kw in presets():
         view.validate()
         if "mlir" not in kw:
-            kw["mlir"] = copy_mlir(view)
+            kw["mlir"] = copy_mlir(view, kw.get("halo", 0))
         entries.append((name, view, {k: v for k, v in kw.items() if v is not None}))
     out.write_text(render_explorer(entries))
     print(f"  wrote {out}")

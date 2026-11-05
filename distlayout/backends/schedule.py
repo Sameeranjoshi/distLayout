@@ -259,6 +259,12 @@ class Text:
     def __floordiv__(self, k: int) -> "Text":
         return Text({}, 0, f"{self._paren()} // {k}")
 
+    def __le__(self, o: Any) -> str:          # printable branch conditions
+        return f"{self} <= {o}"
+
+    def __lt__(self, o: Any) -> str:
+        return f"{self} < {o}"
+
     def _paren(self) -> str:
         s = str(self)
         return s if (s.isidentifier() or s.isdigit()) else f"({s})"

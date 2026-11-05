@@ -49,7 +49,7 @@ def test_air_code():
     code, table = air_code(v)
     assert "l2[tx*25 : tx*25 + 25]" in code and len(table) == 16
     uneven = bind(Buf(99), Decomposition(UnevenBlock(0, parts=4)), Map(Grid(4), {0: 0}))
-    assert air_code(uneven)[1] == [] and "uneven" in air_code(uneven)[0]
+    assert air_code(uneven)[1] == [] and "air.ops.branch(tx <= 2)" in air_code(uneven)[0]
 
 
 def test_page_is_self_contained():

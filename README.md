@@ -52,9 +52,9 @@ with air.herd(air_backend.herd_space(view), shape=(2,)) as h:
 | Category | Feature | Core (Python) | Explorer | AIR backend |
 |---|---|---|---|---|
 | 1. Structured sharding | Block | ✅ | ✅ | ✅ byte-identical to upstream eltwise_add |
-| | Uneven block | ✅ | ✅ | ❌ not yet (needs per-core sizes: padding or branches) |
+| | Uneven block | ✅ | ✅ | ✅ one `air.ops.branch` per size class, L1 tile at the largest size |
 | | Replication | ✅ | ✅ | ✅ |
-| | Rectangular halo (`plan`) | ✅ | ✅ | ❌ not yet |
+| | Rectangular halo (`plan`) | ✅ | ✅ | ✅ `halo_load` / `store_owned`: read from L2, zeros outside the tensor (core fill, DMA pad or clip) |
 | | All-reduce, all-to-all | ⏸ on hold (compute-side collectives) | | |
 | 2. Affine owner maps | `OwnerMap` + quasi-affine `expr` (`+ - *const floordiv mod`) | ✅ | ✅ | ✅ via owner-map inversion (`backends/schedule.py`) |
 | | Cyclic, block-cyclic, skew, tile split | ✅ | ✅ | ✅ `air.sequential` loops over each PE's pieces; built with real `air.api` |
@@ -84,6 +84,34 @@ refine(rank_view, axis=0, k=2)             # owner = [g0 = t0 floordiv 2, g1 = t
 - Expressions use MLIR's quasi-affine language and print in its syntax (`(t0 floordiv 2) mod 4`).
 - Grid axes without an expression are replicated, and must be listed in `replicate=`.
 - When a PE holds several pieces, every local buffer is a stack of tiles, `(slot, *tile)`. With tiles of different sizes it is flat.
+
+### Uneven layouts and halos to AIR
+
+`air.api` transfers need static sizes, so PEs whose regions differ in size get one branch each. PEs whose regions have the same size form a **size class**, and within a class the offset is affine. Examples:
+- uneven 99 over 4: PEs 0–2 vs PE 3;
+- halo: first / interior / last PE.
+
+```python
+with air.herd(air_backend.herd_space(view)) as h:
+    @h.body
+    def _(tx):
+        a = air.alloc(list(air_backend.region_shape(view, halo=1)), f32, scope=h.private())
+        air_backend.halo_load(view, a, (tx,), halo=1, src=l2_in)      # own block + 1 cell per side
+        ...                                                          # stencil on a
+        air_backend.store_owned(view, a, (tx,), halo=1, dst=l2_out)   # writes the owned cells only
+```
+
+For block 48 over 4 with halo 1, this emits three `scf.if` branches:
+- **first PE:** zero the tile, load `l2[0:13]` into `a[1:14]`;
+- **interior PEs:** load `l2[tx*12 - 1 : tx*12 + 13]`;
+- **last PE:** zero the tile, load `l2[35:48]` into `a[0:13]`.
+
+Halo cells are read from the shared L2 buffer, the segment-wide view of the tensor, not exchanged PE to PE. Boundary options:
+- `boundary="zero"` (default): the core zero-fills edge tiles.
+- `"pad"`: the memtile DMA does the zero-fill; needs an `air.api` with DMA padding, which the Oct-2026 wheel lacks.
+- `"clip"`: edge tiles are smaller, with no ghost cells outside the tensor.
+
+`load_local` / `store_local` use the same classes for uneven layouts automatically.
 
 ### Owner maps to AIR
 

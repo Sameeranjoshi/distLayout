@@ -53,17 +53,19 @@ def _placement(view: DistributedView):
 
 
 def _check_emittable(view: DistributedView) -> None:
-    if not view.is_uniform():
-        sizes = sorted({view.local_shape(pe) for pe in view.grid.coords()})
-        raise NotImplementedError(
-            f"uneven layout {view.decomposition!r}: local shapes {sizes} differ between PEs, "
-            f"and air.api transfers need one static size. Use view.plan(pe) to inspect it; "
-            f"AIR emission of uneven layouts is not implemented yet."
-        )
     # Every PE's region must lie inside the source window (matters for partial sources).
     for pe in view.grid.coords():
         for r in view.held_regions(pe):
             view.source_region(r)
+
+
+def _check_uniform(view: DistributedView, what: str) -> None:
+    if not view.is_uniform():
+        sizes = sorted({view.local_shape(pe) for pe in view.grid.coords()})
+        raise NotImplementedError(
+            f"{what}: uneven layout {view.decomposition!r} gives PEs different sizes {sizes}, so there is "
+            f"no single region formula. load_local / store_local / for_each_region handle it with one "
+            f"branch per size class.")
 
 
 def _check_placement(view: DistributedView) -> None:
@@ -72,6 +74,7 @@ def _check_placement(view: DistributedView) -> None:
         raise NotImplementedError(
             f"{view.mapping!r} is an owner map: a PE holds several pieces, so there is no single "
             f"region per PE. Use for_each_piece / load_local, which loop over the PE's pieces.")
+    _check_uniform(view, "single-region offsets")
 
 
 def offsets(view: DistributedView, coords: Sequence[Any]) -> Tuple[Any, ...]:
@@ -117,6 +120,7 @@ def schedule(view: DistributedView):
     """The loop nest giving each PE its pieces (see :mod:`distlayout.backends.schedule`)."""
     from .schedule import solve
     _check_emittable(view)
+    _check_uniform(view, "owner-map emission")
     return solve(view)
 
 
@@ -176,6 +180,161 @@ def for_each_piece(view: DistributedView, coords: Sequence[Any], body: Callable[
     _loop_nest(air, sched.loops, lambda s: body(sched.slot(s), _piece_key(view, sched.pieces(coords, s))))
 
 
+# -- size classes: uneven layouts and halos (placement maps) ---------------------
+
+def _axis_runs(view: DistributedView, a: int, radius: int, boundary: str):
+    """``(grid axis or None, runs)`` for tensor axis ``a``.
+
+    A run is a range of PE coordinates ``c0..c1`` along the grid axis over which
+    everything static agrees -- request size, pads, owned size and position in
+    the tile -- and the request start is affine, ``lo0 + (c - c0) * d``.
+    """
+    n = view.shape[a]
+    padded = boundary in ("zero", "pad")
+    pb_whole = radius if padded else 0
+    rule_k = next((k for k, r in enumerate(view.decomposition.rules) if r.axis == a), None)
+    if rule_k is None:
+        return None, [dict(c0=0, c1=0, lo0=0, d=0, size=n, pb=pb_whole, pa=pb_whole, own_off=pb_whole, own=n)]
+    g = _placement(view).place_dict[rule_k]
+    rule = view.decomposition.rules[rule_k]
+    sizes = rule.sizes(n)
+    starts = [sum(sizes[:i]) for i in range(len(sizes))]
+    runs: List[dict] = []
+    for c, (st, sz) in enumerate(zip(starts, sizes)):
+        lo, hi = max(0, st - radius), min(n, st + sz + radius)
+        pb = (lo - (st - radius)) if padded else 0
+        pa = ((st + sz + radius) - hi) if padded else 0
+        key = (hi - lo, pb, pa, st - lo + pb, sz)
+        r = runs[-1] if runs else None
+        if r is not None and r["key"] == key and (r["d"] is None or lo - r["last"] == r["d"]):
+            r["d"] = lo - r["last"] if r["d"] is None else r["d"]
+            r["c1"], r["last"] = c, lo
+            continue
+        runs.append(dict(c0=c, c1=c, lo0=lo, d=None, last=lo, key=key, size=hi - lo, pb=pb, pa=pa,
+                         own_off=st - lo + pb, own=sz))
+    for r in runs:
+        r["d"] = r["d"] or 0
+    return g, runs
+
+
+def region_shape(view: DistributedView, halo: int = 0, boundary: str = "zero") -> Tuple[int, ...]:
+    """L1 tile that holds any PE's region (+ halo): the per-axis maximum over size classes."""
+    return tuple(max(r["size"] + r["pb"] + r["pa"] for r in _axis_runs(view, a, halo, boundary)[1])
+                 for a in range(len(view.shape)))
+
+
+def size_classes(view: DistributedView, halo: int = 0, boundary: str = "zero") -> List[List[dict]]:
+    """Per tensor axis, its runs (for printing and tests)."""
+    return [_axis_runs(view, a, halo, boundary)[1] for a in range(len(view.shape))]
+
+
+def for_each_region(view: DistributedView, coords: Sequence[Any], body: Callable[..., Any], halo: int = 0,
+                    boundary: str = "zero", air: Any = None) -> None:
+    """Call ``body(keys)`` for this PE's region, inside one ``air.ops.branch`` per size class.
+
+    For placement maps whose PEs differ in size (uneven) or in their halo (edge
+    PEs). ``keys`` holds static-size subscripts for that class:
+
+    * ``src``: the request window of the source (own region grown by ``halo``,
+      clipped to the tensor);
+    * ``tile``: the part of the L1 tile (from :func:`region_shape`) this PE uses;
+    * ``window``: where the source window lands inside it;
+    * ``pad_before`` / ``pad_after``: cells per axis outside the tensor, which
+      ``boundary="zero"`` / ``"pad"`` turn into zeros so every PE sees a full
+      ``b + 2*halo`` tile (``None`` when there are none);
+    * ``own_tile`` / ``own_src``: the PE's owned region inside the tile and in
+      the source -- what a store writes back (never the halo).
+
+    With concrete ``coords`` (ints) the class is chosen in Python, without branches.
+    """
+    air = air or _air()
+    _check_emittable(view)
+    if _placement(view) is None:
+        raise NotImplementedError("for_each_region is for placement maps; owner maps use for_each_piece")
+    if boundary not in ("zero", "pad", "clip"):
+        raise ValueError(f"boundary must be 'zero', 'pad' or 'clip', got {boundary!r}")
+    axes = [_axis_runs(view, a, halo, boundary) for a in range(len(view.shape))]
+    origin = view.source.origin
+
+    def emit(i: int, chosen: List[Tuple[Any, dict]]) -> None:
+        if i == len(axes):
+            src, tile, win, own_tile, own_src, pb, pa = [], [], [], [], [], [], []
+            for a, (x, r) in enumerate(chosen):
+                lo = r["lo0"] - r["c0"] * r["d"] - origin[a]
+                if x is not None and r["d"]:
+                    lo = x * r["d"] + lo if lo else x * r["d"]
+                src.append(slice(lo, lo + r["size"]))
+                tile.append(slice(0, r["size"] + r["pb"] + r["pa"]))
+                win.append(slice(r["pb"], r["pb"] + r["size"]))
+                own_tile.append(slice(r["own_off"], r["own_off"] + r["own"]))
+                st = lo + (r["own_off"] - r["pb"])
+                own_src.append(slice(st, st + r["own"]))
+                pb.append(r["pb"]); pa.append(r["pa"])
+            body(dict(src=tuple(src), tile=tuple(tile), window=tuple(win), own_tile=tuple(own_tile), own_src=tuple(own_src),
+                      pad_before=pb if any(pb) else None, pad_after=pa if any(pa) else None))
+            return
+        g, runs = axes[i]
+        x = coords[g] if g is not None else None
+        if len(runs) == 1:
+            emit(i + 1, chosen + [(x, runs[0])])
+        elif isinstance(x, int):
+            emit(i + 1, chosen + [(x, next(r for r in runs if r["c0"] <= x <= r["c1"]))])
+        else:
+            def chain(j: int) -> None:
+                if j == len(runs) - 1:
+                    emit(i + 1, chosen + [(x, runs[j])])
+                    return
+                with air.ops.branch(x <= runs[j]["c1"]) as b:
+                    emit(i + 1, chosen + [(x, runs[j])])
+                with b.otherwise():
+                    chain(j + 1)
+            chain(0)
+    emit(0, [])
+
+
+def _sub(buf: Any, key: Tuple[slice, ...], full: Sequence[int]) -> Any:
+    """``buf[key]``, or ``buf`` itself when the key covers all of it."""
+    return buf if all(k.start == 0 and k.stop == n for k, n in zip(key, full)) else buf[key]
+
+
+def halo_load(view: DistributedView, dst: Any, coords: Sequence[Any], halo: int, src: Any = None,
+              boundary: str = "zero", air: Any = None) -> None:
+    """Fill ``dst`` (shape :func:`region_shape`) with this PE's region plus ``halo`` cells per side.
+
+    The neighbors' cells are read from the shared source buffer (L2), not sent
+    PE to PE: the L2 buffer is the segment-wide view of the tensor. Cells
+    outside the tensor, at its edges:
+
+    * ``boundary="zero"`` (default): the edge PEs fill their tile with 0 on the
+      core, then load the window at its offset;
+    * ``"pad"``: the memtile DMA zero-fills (``pad_before``/``pad_after``; needs
+      an ``air.api`` that supports DMA padding);
+    * ``"clip"``: no ghost cells outside the tensor; edge tiles are smaller.
+    """
+    air = air or _air()
+    src = view.source.handle if src is None else src
+    full = region_shape(view, halo, boundary)
+
+    def body(k):
+        if boundary == "pad" or not (k["pad_before"] or k["pad_after"]):
+            air.ops.load(_sub(dst, k["tile"], full), src[k["src"]],
+                         **({"pad_before": k["pad_before"], "pad_after": k["pad_after"]} if boundary == "pad" else {}))
+        else:
+            air.ops.fill(dst, 0.0)
+            air.ops.load(_sub(dst, k["window"], full), src[k["src"]])
+    for_each_region(view, coords, body, halo=halo, boundary=boundary, air=air)
+
+
+def store_owned(view: DistributedView, tile: Any, coords: Sequence[Any], halo: int = 0, dst: Any = None,
+                boundary: str = "zero", air: Any = None) -> None:
+    """Write the owned part of ``tile`` (not its halo) back to this PE's region of ``dst``."""
+    air = air or _air()
+    dst = view.source.handle if dst is None else dst
+    full = region_shape(view, halo, boundary)
+    for_each_region(view, coords, lambda k: air.ops.store(_sub(tile, k["own_tile"], full), dst[k["own_src"]]),
+                    halo=halo, boundary=boundary, air=air)
+
+
 def local_shape(view: DistributedView) -> Tuple[int, ...]:
     """The L1 buffer ``load_local`` fills: the piece (placement) or ``(slots, *tile)`` (owner map)."""
     if _placement(view) is not None:
@@ -200,6 +359,8 @@ def load_local(view: DistributedView, dst: Any, coords: Sequence[Any], src: Any 
     air = air or _air()
     src = view.source.handle if src is None else src
     if _placement(view) is not None:
+        if not view.is_uniform():
+            return halo_load(view, dst, coords, 0, src=src, air=air)
         return air.ops.load(dst, local_region(view, coords, src))
     for_each_piece(view, coords, lambda slot, key: air.ops.load(dst[_stack_key(view, slot)], src[key]), air=air)
 
@@ -209,6 +370,8 @@ def store_local(view: DistributedView, src: Any, coords: Sequence[Any], dst: Any
     air = air or _air()
     dst = view.source.handle if dst is None else dst
     if _placement(view) is not None:
+        if not view.is_uniform():
+            return store_owned(view, src, coords, 0, dst=dst, air=air)
         return air.ops.store(src, local_region(view, coords, dst))
     for_each_piece(view, coords, lambda slot, key: air.ops.store(src[_stack_key(view, slot)], dst[key]), air=air)
 
@@ -222,7 +385,7 @@ def herd_space(view: DistributedView) -> List[range]:
     """
     _check_emittable(view)
     pm = _placement(view)
-    if pm is None:
+    if pm is None or not view.is_uniform():
         return [range(0, n) for n in view.grid.shape]
     placed = {g: k for k, g in pm.place}
     size = view.local_shape(next(view.grid.coords()))
@@ -237,11 +400,12 @@ def herd_space(view: DistributedView) -> List[range]:
 
 
 def copy_kernel(view: DistributedView, dtype: Any = None, cores: Optional[Sequence[int]] = None,
-                name: str = "dist_copy", air: Any = None) -> Any:
+                name: str = "dist_copy", halo: int = 0, boundary: str = "zero", air: Any = None) -> Any:
     """A complete ``air.api`` launch that scatters through the layout and gathers back.
 
-    L3 ``A`` -> L2 -> each PE loads its pieces (one reused L1 tile per core) ->
-    stores them to a second L2 buffer -> L3 ``C``. Running it must give ``C ==
+    L3 ``A`` -> L2 -> each PE loads its pieces (one reused L1 tile per core;
+    with ``halo``, its region plus halo) -> stores what it owns to a second L2
+    buffer -> L3 ``C``. Running it must give ``C ==
     A``, which checks every DMA window of the layout end to end. ``cores`` is
     the herd's physical shape (default: one core per grid point).
     """
@@ -249,7 +413,9 @@ def copy_kernel(view: DistributedView, dtype: Any = None, cores: Optional[Sequen
     if dtype is None:
         from air.api.types import f32 as dtype  # type: ignore[import-not-found]
     shape = list(view.shape)
-    tile = list(_tile(view)) if _placement(view) is None else list(view.max_local_shape())
+    regions = _placement(view) is not None and (halo or not view.is_uniform())
+    tile = (list(region_shape(view, halo, boundary)) if regions else
+            list(_tile(view)) if _placement(view) is None else list(view.max_local_shape()))
     A = air.tensor(shape, dtype)
     C = air.tensor(shape, dtype)
     with air.launch(name=name) as launch:
@@ -265,6 +431,11 @@ def copy_kernel(view: DistributedView, dtype: Any = None, cores: Optional[Sequen
                     with air.herd(herd_space(view), name=name + "_herd", **kw) as h:
                         def body(*coords):
                             a = air.alloc(tile, dtype, scope=h.private())
+
+                            if regions:
+                                halo_load(view, a, coords, halo, src=l2_in, boundary=boundary, air=air)
+                                store_owned(view, a, coords, halo, dst=l2_out, boundary=boundary, air=air)
+                                return
 
                             def piece(slot, key):
                                 air.ops.load(a, l2_in[key])

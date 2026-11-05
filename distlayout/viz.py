@@ -102,16 +102,15 @@ def spec_code(view: DistributedView, src: str = "buf") -> str:
     return f"view = bind({src}, Decomposition({rules}), {mapping})"
 
 
-def air_code(view: DistributedView, src: str = "l2", dtype: str = "f32") -> Tuple[str, List[Tuple[Tuple[int, ...], Tuple[slice, ...]]]]:
-    """(``air.api`` herd body, per-PE concrete slices). Uniform placements only."""
+def air_code(view: DistributedView, src: str = "l2", dtype: str = "f32",
+             halo: int = 0) -> Tuple[str, List[Tuple[Tuple[int, ...], Tuple[slice, ...]]]]:
+    """(``air.api`` herd body, per-PE slices). The slices are given for uniform placements without halo."""
     from .backends import air as backend
 
     names = ["tx", "ty", "tz"][: view.grid.rank]
-    if not view.is_uniform():
-        return ("# uneven layout: PEs hold different sizes, and air.api needs one static\n"
-                "# transfer size, so the AIR backend does not emit this layout yet.", [])
-    if as_placement(view.mapping, view.decomposition.num_parts(view.shape)) is None:
-        return _owner_map_code(view, names, src, dtype), []
+    if (halo or not view.is_uniform()
+            or as_placement(view.mapping, view.decomposition.num_parts(view.shape)) is None):
+        return _traced_code(view, names, src, dtype, halo), []
     key = backend.slice_key(view, [_Sym.of(n) for n in names])
     sub = ", ".join(f"{k.start} : {k.stop}" for k in key)
     herd = ", ".join(f"range({r.start}, {r.stop}, {r.step})" if r.step != 1 else f"range({r.stop})"
@@ -124,40 +123,125 @@ def air_code(view: DistributedView, src: str = "l2", dtype: str = "f32") -> Tupl
     return code, [(pe, backend.slice_key(view, pe)) for pe in view.grid.coords()]
 
 
-def _owner_map_code(view: DistributedView, names: List[str], src: str, dtype: str) -> str:
-    """The herd body for an owner map: a loop over this PE's pieces, offsets from the inverted map."""
+class _TextAir:
+    """A stand-in for ``air.api`` that writes the calls it receives as Python source."""
+
+    def __init__(self, indent: str = "    ") -> None:
+        self.lines: List[str] = []
+        self.ind = indent
+        self.nb = 0
+        outer = self
+
+        class ops:
+            @staticmethod
+            def load(dst, src, pad_before=None, pad_after=None):
+                pads = (f", pad_before={pad_before}" if pad_before else "") + (f", pad_after={pad_after}" if pad_after else "")
+                outer.emit(f"air.ops.load({dst}, {src}{pads})")
+
+            @staticmethod
+            def store(src, dst):
+                outer.emit(f"air.ops.store({src}, {dst})")
+
+            @staticmethod
+            def fill(buf, value):
+                outer.emit(f"air.ops.fill({buf}, {value})               # ghost cells outside the tensor")
+
+            @staticmethod
+            def branch(cond):
+                return outer._branch(cond)
+
+        self.ops = ops
+
+    def emit(self, line: str) -> None:
+        self.lines.append(self.ind + line)
+
+    def sequential(self, lo, hi):
+        from .backends.schedule import Text
+        name = f"s{sum(l.strip().startswith('for ') for l in self.lines)}"
+        self.emit(f"for {name} in air.sequential({lo}, {hi}):")
+        self.ind += "  "
+        yield Text.var(name)
+        self.ind = self.ind[:-2]
+
+    def _branch(self, cond):
+        outer = self
+        name = f"b{self.nb}"
+        self.nb += 1
+
+        class B:
+            def __enter__(self):
+                outer.emit(f"with air.ops.branch({cond}) as {name}:")
+                outer.ind += "  "
+                return self
+
+            def __exit__(self, *exc):
+                outer.ind = outer.ind[:-2]
+                return False
+
+            def otherwise(self):
+                class O:
+                    def __enter__(self_inner):
+                        outer.emit(f"with {name}.otherwise():")
+                        outer.ind += "  "
+
+                    def __exit__(self_inner, *exc):
+                        outer.ind = outer.ind[:-2]
+                        return False
+                return O()
+
+        return B()
+
+
+class _TextBuf:
+    def __init__(self, name: str, shape: Sequence[int]) -> None:
+        self.name, self.shape = name, tuple(shape)
+
+    def __getitem__(self, key):
+        key = key if isinstance(key, tuple) else (key,)
+        return _TextBuf(self.name + "[" + ", ".join(f"{k.start} : {k.stop}" if isinstance(k, slice) else str(k)
+                                                    for k in key) + "]", ())
+
+    def __str__(self) -> str:
+        return self.name
+
+
+def _traced_code(view: DistributedView, names: List[str], src: str, dtype: str, halo: int) -> str:
+    """The herd body the AIR backend emits for ``view``, traced into text."""
     from .backends import air as backend
     from .backends.schedule import Text
+    coords = [Text.var(n) for n in names]
+    w = _TextAir()
+    l2 = _TextBuf(src, view.shape)
+    placement = as_placement(view.mapping, view.decomposition.num_parts(view.shape)) is not None
     try:
-        sched = backend.schedule(view)
+        if placement:
+            tile = list(backend.region_shape(view, halo))
+            a = _TextBuf("a", tile)
+            backend.halo_load(view, a, coords, halo, src=l2, air=w)
+            w.emit("...                                   # compute on a")
+            backend.store_owned(view, a, coords, halo, dst=_TextBuf(src + "_out", view.shape), air=w)
+            note = (f"# {len(backend.size_classes(view, halo)[0])} size class(es) per cut axis; "
+                    f"each branch has static sizes" + (f"; halo {halo} read from {src}, zeros outside the tensor"
+                                                       if halo else ""))
+        else:
+            tile = list(view.partition_region(next(view.partitions())).size)
+            a = _TextBuf("a", tile)
+
+            def piece(slot, key):
+                w.ops.load(a, l2[key])
+                w.emit("  ...                                 # compute on piece a"[2:])
+                w.ops.store(a, _TextBuf(src + "_out", view.shape)[key])
+            backend.for_each_piece(view, coords, piece, air=w)
+            pieces = len(view.pieces_at(next(view.grid.coords())))
+            note = (f"# {pieces} pieces per PE; owner map inverted by distlayout.backends.schedule: "
+                    + ", ".join(f"g{g} = {e}" for g, e in sorted(view.mapping.exprs().items())))
     except NotImplementedError as e:
         return f"# not emitted: {e}"
-    tile = list(view.partition_region(next(view.partitions())).size)
-    loop_names: List[str] = []
-
-    class Seq:
-        @staticmethod
-        def sequential(lo, hi):
-            loop_names.append((f"s{len(loop_names)}", hi))
-            yield Text.var(loop_names[-1][0])
-
-    keys: List[str] = []
-    backend.for_each_piece(view, [Text.var(n) for n in names],
-                           lambda slot, key: keys.append(", ".join(f"{k.start} : {k.stop}" for k in key)), air=Seq)
-    ind = "    "
-    lines = [f"with air.herd([{', '.join(f'range({n})' for n in view.grid.shape)}]) as h:", "  @h.body",
-             f"  def _({', '.join(names)}):",
-             f"    a = air.alloc({tile}, {dtype}, scope=h.private())   # one tile, reused for each piece"]
-    for nm, hi in loop_names:
-        lines.append(f"{ind}for {nm} in air.sequential(0, {hi}):")
-        ind += "  "
-    lines.append(f"{ind}air.ops.load(a, {src}[{keys[0]}])")
-    lines.append(f"{ind}...                                  # compute on piece a")
-    pieces = len(view.pieces_at(next(view.grid.coords())))
-    lines += ["", f"# {pieces} pieces per PE; owner map inverted by distlayout.backends.schedule:",
-              f"#   {', '.join(f'g{g} = {e}' for g, e in sorted(view.mapping.exprs().items()))}",
-              "# with distlayout: air_backend.for_each_piece(view, coords, body)"]
-    return "\n".join(lines)
+    herd = ", ".join(f"range({r.start}, {r.stop}, {r.step})" if r.step != 1 else f"range({r.stop})"
+                     for r in backend.herd_space(view))
+    head = [f"with air.herd([{herd}]) as h:", "  @h.body", f"  def _({', '.join(names)}):",
+            f"    a = air.alloc({tile}, {dtype}, scope=h.private())"]
+    return "\n".join(head + w.lines + ["", note])
 
 
 # -- view -> page spec -------------------------------------------------------------
@@ -202,8 +286,9 @@ def to_spec(view: DistributedView, title: str = "", note: str = "", halo: int = 
             "cuts": cuts, "map": mapping, "halo": halo, "bytes": elem_bytes, "kib": pe_kib, "src": src}
     if mlir:
         spec["mlir"] = mlir
-    if as_placement(view.mapping, view.decomposition.num_parts(view.shape)) is None:
-        spec["air"] = air_code(view, src)[0]
+    if (halo or not view.is_uniform()
+            or as_placement(view.mapping, view.decomposition.num_parts(view.shape)) is None):
+        spec["air"] = air_code(view, src, halo=halo)[0]
     return spec
 
 
@@ -397,8 +482,7 @@ function attrText(L){
   if(L.placement){const pl=L.exprs.map((e,g)=>e?[e.k,g]:null).filter(Boolean).sort((a,b)=>a[0]-b[0]);return head+`place = [${pl.map(([k,g])=>`${k} -> g${g}`).join(", ")}], `+rep}
   return head+`owner = [${L.exprs.map((e,g)=>e?`g${g} = ${strE(e)}`:null).filter(Boolean).join(", ")}], `+rep}
 function airText(L){
-  if(!L.placement)return cur.air||"# owner map edited: the page does not invert owner maps itself.\n# The Python backend does: air_backend.for_each_piece(view, coords, body)\n# (python3 examples/gallery.py embeds the emitted loop nest for each preset).";
-  if(!L.uniform)return "# uneven layout: PEs hold different sizes, and air.api needs one static\n# transfer size, so the AIR backend does not emit this layout yet.";
+  if(!L.placement||!L.uniform||(+L.spec.halo||0)>0)return cur.air||"# This layout is emitted with loops (owner maps) or one branch per size class\n# (uneven, halo), which the Python backend computes: air_backend.for_each_piece /\n# halo_load. python3 examples/gallery.py embeds the emitted code for each preset;\n# editing the layout here drops it.";
   const names=["tx","ty","tz"].slice(0,L.grid.length), src=L.spec.src||"l2", gOf=k=>L.exprs.findIndex(e=>e&&e.k===k);
   const sub=L.shape.map((n,a)=>{const k=L.rules.findIndex(r=>r.axis===a);if(k<0)return `0 : ${n}`;const b=L.rules[k].sizes[0],c=names[gOf(k)];return `${c}*${b} : ${c}*${b} + ${b}`}).join(", ");
   const herd=L.grid.map((n,g)=>{const e=L.exprs[g];if(!e)return `range(${n})`;const r=L.rules[e.k];return `range(0, ${L.shape[r.axis]}, ${r.sizes[0]})`}).join(", ");
@@ -538,7 +622,7 @@ function showCode(L){
   $("tabs").querySelectorAll("button").forEach(b=>b.onclick=()=>{tab=b.dataset.t;showCode(L)});$("code").textContent=t[tab][1]}
 $("shape").onchange=()=>{cur.shape=parseList($("shape").value);cur.cuts=cur.cuts.filter(c=>c.axis<cur.shape.length).map(c=>{const d=Object.assign({},c);delete d.sizes;return d});delete cur.mlir;delete cur.air;syncForm();render()};
 $("grid").onchange=()=>{cur.grid=parseList($("grid").value);cur.map=cur.grid.map((_,g)=>cur.map[g]||"");delete cur.mlir;delete cur.air;syncForm();render()};
-["halo","bytes","kib"].forEach(id=>$(id).oninput=()=>{cur[id]=+$(id).value;render()});
+["halo","bytes","kib"].forEach(id=>$(id).oninput=()=>{cur[id]=+$(id).value;if(id==="halo"){delete cur.air;delete cur.mlir}render()});
 $("pin").onclick=()=>{if(window.__last){pinned={name:`${cur.title||"layout"} on ${cur.grid.join("×")}`,maxB:window.__last.maxB};render()}};
 $("svg").onclick=()=>{const s=$("pic").querySelector("svg");if(!s)return;const css=getComputedStyle(document.documentElement);
   const v=(n,d)=>css.getPropertyValue(n).trim()||d;

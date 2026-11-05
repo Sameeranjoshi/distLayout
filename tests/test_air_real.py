@@ -21,7 +21,7 @@ np = pytest.importorskip("numpy")
 
 from air.api.types import f32  # noqa: E402
 
-from distlayout import Block, Decomposition, Grid, Map, Replicate, bind  # noqa: E402
+from distlayout import Block, Decomposition, Grid, Map, Replicate, UnevenBlock, bind  # noqa: E402
 from distlayout.backends import air as air_backend  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -120,3 +120,28 @@ def test_owner_map_copy_kernel_builds(name):
     assert offset_text in text                      # the inverted owner map reaches the DMA offset
     if loops is not None:
         assert text.count("scf.for") >= loops       # one sequential loop per piece coordinate solved by a loop
+
+
+# -- category 1 completion: uneven and halo through size classes -----------------
+
+REGION_CASES = {
+    "uneven": (lambda: bind(_Shape(99), Decomposition(UnevenBlock(0, parts=4)), Map(Grid(4), {0: 0})), 0,
+               ["[75] [24] [1]"]),
+    "halo1d": (lambda: bind(_Shape(48), Decomposition(Block(0, 4)), Map(Grid(4), {0: 0})), 1,
+               ["%alloc_3[1] [13] [1], %arg14[0] [13] [1]", "[35] [13] [1]", "[14] [1]"]),
+    "halo2d": (lambda: bind(_Shape(16, 32), Decomposition(Block(0, 2), Block(1, 2)), Map(Grid((2, 2)), {0: 0, 1: 1})), 1,
+               ["[9, 17]", "[8, 16]"]),
+    "uneven_halo": (lambda: bind(_Shape(10), Decomposition(UnevenBlock(0, sizes=[3, 3, 4])), Map(Grid(3), {0: 0})), 1,
+                    ["[5] [5] [1]", "[6] [4] [1]"]),
+}
+
+
+@pytest.mark.parametrize("name", sorted(REGION_CASES))
+def test_region_copy_kernel_builds(name):
+    make, halo, fragments = REGION_CASES[name]
+    text = str(air_backend.copy_kernel(make(), name=name, halo=halo).build(target="npu2"))
+    assert "scf.if" in text                         # one branch per size class
+    for f in fragments:
+        assert f in text, f
+    if halo:
+        assert "memref.store %cst" in text          # edge PEs zero their ghost cells
