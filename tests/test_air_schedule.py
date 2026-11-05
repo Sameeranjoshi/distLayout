@@ -134,14 +134,13 @@ def test_load_local_fills_the_stack():
     assert kind == "load" and subs(dst[1]) == ["s0", "0 : 2"] and subs(src[1]) == ["(tx % 4)*2 + s0*8 : (tx % 4)*2 + s0*8 + 2"]
 
 
-@pytest.mark.parametrize("make,msg", [
-    (lambda: bind(Buf(8), Decomposition(Block(0, 8)), OwnerMap(Grid(4), {0: "(t0 * 2) mod 4"})), "coefficient"),
-    (lambda: bind(Buf(8, 8), Decomposition(Block(0, 2), Block(1, 2)),
-                  OwnerMap(Grid((2, 2)), {0: "t0", 1: "t0"})), "two grid axes"),
-])
-def test_refuses_what_it_cannot_invert(make, msg):
-    with pytest.raises(NotImplementedError, match=msg):
-        solve(make())
+def test_same_coordinate_on_two_axes_becomes_a_consistency_check():
+    v = bind(Buf(8, 8), Decomposition(Block(0, 2), Block(1, 2)), OwnerMap(Grid((2, 2)), {0: "t0", 1: "t0"}))
+    sch = solve(v)                                         # diagonal: PE (i, i) holds row-block i
+    assert sch.checks and sorted(p for _, p in sch.concrete((1, 1))) == sorted(v.pieces_at((1, 1)))
+    assert sch.concrete((0, 1)) == [] and v.pieces_at((0, 1)) == ()
+    _, calls = emitted(v)
+    assert ("if", "tx == ty") in calls
 
 
 # -- closing the gaps: modular inverse, uneven piece counts ------------------------
@@ -178,7 +177,11 @@ def test_block_cyclic_tail_and_group_tail():
     assert sch.loops == [3] and sch.guards == ((0, 10),) and [len(sch.concrete((p,))) for p in range(4)] == [3, 3, 3, 1]
 
 
-def test_gcd_greater_than_one_is_still_refused():
+def test_gcd_greater_than_one_becomes_a_guarded_scan():
+    # 2*t0 mod 4 only reaches PEs 0 and 2, two pieces each: scan t0, keep trips where owner == tx
     v = bind(Buf(8), Decomposition(Block(0, 8)), OwnerMap(Grid(4), {0: "(t0 * 2) mod 4"}))
-    with pytest.raises(NotImplementedError, match="invertible"):
-        solve(v)
+    sch = solve(v)
+    assert sch.scanned == (0,) and sch.loops == [8]
+    assert [len(sch.concrete((p,))) for p in range(4)] == [4, 0, 4, 0]
+    _, calls = emitted(v)
+    assert ("if", "(s0*2) % 4 == tx") in calls

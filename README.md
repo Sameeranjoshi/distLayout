@@ -61,7 +61,8 @@ with air.herd(air_backend.herd_space(view), shape=(2,)) as h:
 | | Several pieces per PE (local `(slot, *tile)`) | ✅ | ✅ | ✅ `for_each_piece`, `load_local` / `store_local` |
 | | Rank splitting `refine(view, axis, k)` → `owner(tx, ty)` | ✅ | ✅ | ✅ |
 | | Coefficients invertible mod P (modular inverse); pieces not dividing evenly over PEs (uniform trips + per-trip guard) | ✅ | ✅ | ✅ |
-| | Coefficients with gcd(a, P) > 1; owner maps with halo or uneven tiles | ✅ | ✅ | ❌ refused with a reason (guarded scan / lookup table; combine piece loop + size classes) |
+| | Same coordinate on several grid axes; coefficients with gcd(a, P) > 1; non-linear owner expressions | ✅ | ✅ | ✅ per-trip consistency guard (`expr == x`), guarded scan of the free coordinates |
+| | Owner maps with halo or uneven tiles; 3-D PE grids | ✅ | ✅ | ❌ refused with a reason (size classes inside the piece loop; `air.api` herds are 1-D / 2-D) |
 | 3. Irregular | Owner arrays (`owner_array` → runs + `TableMap`) | ✅ | ✅ | ✅ owned + ghost x via `ghost_load`, any table; renumbered tables also as an uneven block |
 | | Sparse access pattern (`CSRPattern`; graphs as adjacency) | ✅ | ✅ graph view, cut edges | — |
 | | Inspector: owned / ghost sets, import & export lists, local CSR (`inspect`) | ✅ | ✅ ghost counts, import arcs | ✅ `ghost_load`: one branch per PE, one static DMA per id run from L2 |
@@ -204,6 +205,25 @@ python3 examples/gallery.py          # writes docs/explorer.html, open it in a b
 For your own views, use `distlayout.viz.render_html(view, halo=1, mlir=text)` or `render_explorer([(name, view, opts), ...])`. The page runs a JavaScript port of the v0 layout rules so the builder updates live. `tests/test_viz.py` checks in a headless browser that it agrees with the Python library on every preset.
 
 ## Tests
+
+**Combination suite** (`tests/test_combinations.py`, with the generator and oracles in `tests/combos.py`). Seeded random layouts are checked against brute-force enumeration through every layer. The layouts vary:
+- 1-D / 2-D tensors;
+- whole, block and uneven cuts (balanced, tail, explicit sizes);
+- placement, owner-map, table and replicate mappings;
+- replication, and `refine` once or twice.
+
+The checks:
+- core invariants;
+- plans for random requests;
+- the generated-Python round trip;
+- owner-map inversion;
+- piece loops and size-class windows with random halos and every boundary mode;
+- the explorer's JavaScript port;
+- real `air.api` builds.
+
+Metamorphic tests check that two spellings of one layout own the same elements: refine twice vs once, any 1-D layout as an owner array, the cyclic family, transposed placements. Irregular tests cross 6 row layouts × 6 x layouts on random sparse patterns, checking the inspector against brute force, SpMV against the dense product, and the AIR gather by replay. The suite runs about 1,600 cases in about 15 s.
+
+### Unit tests
 
 ```bash
 python3 -m pytest -q

@@ -62,10 +62,13 @@ def _check_emittable(view: DistributedView) -> None:
 def _check_uniform(view: DistributedView, what: str) -> None:
     if not view.is_uniform():
         sizes = sorted({view.local_shape(pe) for pe in view.grid.coords()})
+        hint = ("load_local / store_local / for_each_region handle it with one branch per size class"
+                if _placement(view) is not None else
+                "owner maps with tiles of different sizes are not emitted yet (it needs size-class branches "
+                "inside the piece loop)")
         raise NotImplementedError(
-            f"{what}: uneven layout {view.decomposition!r} gives PEs different sizes {sizes}, so there is "
-            f"no single region formula. load_local / store_local / for_each_region handle it with one "
-            f"branch per size class.")
+            f"{what}: uneven layout {view.decomposition!r} gives pieces different sizes {sizes}, so there is "
+            f"no single region formula; {hint}.")
 
 
 def _check_placement(view: DistributedView) -> None:
@@ -179,19 +182,21 @@ def for_each_piece(view: DistributedView, coords: Sequence[Any], body: Callable[
     sched = schedule(view)
 
     def trip(s):
+        from .schedule import _eval
         pid = sched.pieces(coords, s)
-        guards = list(sched.guards)
+        conds = [(pid[k], "lt", n) for k, n in sched.guards] + \
+                [(_eval(e, pid), "eq", coords[g]) for g, e in sched.checks]
 
         def guarded(i):
-            if i == len(guards):
+            if i == len(conds):
                 body(sched.slot(s), _piece_key(view, pid))
                 return
-            k, n = guards[i]
-            if isinstance(pid[k], int):                 # concrete: decide in Python
-                if pid[k] < n:
+            a, op, b = conds[i]
+            if isinstance(a, int) and isinstance(b, int):   # concrete: decide in Python
+                if (a < b) if op == "lt" else (a == b):
                     guarded(i + 1)
                 return
-            with air.ops.branch(pid[k] < n):            # this trip only on PEs that have the piece
+            with air.ops.branch(a < b if op == "lt" else a == b):   # only on PEs that hold this trip's piece
                 guarded(i + 1)
         guarded(0)
     _loop_nest(air, sched.loops, trip)

@@ -49,10 +49,10 @@ class Expr:
 
     def __mul__(self, o: "ExprLike") -> "Expr":
         o = lift(o)
-        if isinstance(o, Const):
-            return Mul(self, o.k)
-        if isinstance(self, Const):
-            return Mul(o, self.k)
+        if not o.vars():                              # any constant expression, e.g. -3 parsed as -(3)
+            return Mul(self, o.eval(()))
+        if not self.vars():
+            return Mul(o, self.eval(()))
         raise TypeError(f"non-affine: {self} * {o} (multiply by a constant only)")
 
     __rmul__ = __mul__
@@ -120,10 +120,12 @@ class Add(Expr):
 
     def __str__(self) -> str:
         b = self.b
-        if isinstance(b, Const) and b.k < 0:
-            return f"{self.a} - {-b.k}"
-        if isinstance(b, Mul) and b.k < 0:
-            return f"{self.a} - {Mul(b.a, -b.k)}"
+        if not b.vars():                              # constant term: print its value
+            v = b.eval(())
+            return f"{self.a} - {-v}" if v < 0 else f"{self.a} + {v}"
+        if isinstance(b, Mul) and b.k < 0:            # a - (...): keep the parentheses of a compound term
+            neg = _atom(b.a) if b.k == -1 else str(Mul(b.a, -b.k))
+            return f"{self.a} - {neg}"
         return f"{self.a} + {b}"
 
 
@@ -187,7 +189,10 @@ def lift(o: ExprLike) -> Expr:
 
 
 def _atom(e: Expr) -> str:
-    return str(e) if isinstance(e, (Var, Const)) else f"({e})"
+    """``e`` as an operand of ``*``, ``floordiv``, ``mod`` or unary minus."""
+    if isinstance(e, Var) or (isinstance(e, Const) and e.k >= 0):
+        return str(e)
+    return f"({e})"
 
 
 def _pos(k: int, what: str) -> int:

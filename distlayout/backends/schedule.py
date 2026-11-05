@@ -21,6 +21,12 @@ owner expression on ``g``                  solved as
 ``gcd(a_j, P) = 1``                         (``s < ceil(n_j / P)``, guarded when ``P ∤ n_j``)
 =========================================  =========================================
 
+A grid axis whose expression only *checks* an already-fixed coordinate (the
+same ``t_k`` on two axes), or whose coordinate has no inverse (``gcd(a, P) > 1``,
+non-linear forms), becomes a per-trip consistency guard ``expr(t) == x_g``; in
+the second case its free coordinates are scanned in full (``Schedule.scanned``
+reports the cost). So every valid owner map inverts.
+
 Piece coordinates no constraint fixes become full loops. When pieces do not
 divide evenly over PEs, every PE still runs the same number of trips (AIR's
 rule) and the surplus trips are skipped by a per-trip guard ``t_k < n_k``.
@@ -71,6 +77,8 @@ class Schedule:
     recipes: Dict[int, Tuple]          # piece coordinate k -> recipe
     ncomp: int
     guards: Tuple[Tuple[int, int], ...] = ()   # (k, n_k): skip trips where t_k >= n_k (uneven piece counts)
+    checks: Tuple[Tuple[int, Any], ...] = ()   # (g, expr): skip trips where expr(t) != x_g (consistency / scan)
+    scanned: Tuple[int, ...] = ()              # piece coordinates looped over fully because no inverse exists
 
     @property
     def slots(self) -> int:
@@ -123,7 +131,8 @@ class Schedule:
         out = []
         for s in product(*(range(e) for e in self.loops)):
             pid = self.pieces(pe, s)
-            if guarded and any(pid[k] >= n for k, n in self.guards):
+            if guarded and (any(pid[k] >= n for k, n in self.guards)
+                            or any(_eval(e, pid) != pe[g] for g, e in self.checks)):
                 continue
             out.append((self.slot(s) if self.loops else 0, pid))
         return out
@@ -137,6 +146,8 @@ def solve(view) -> Schedule:
     recipes: Dict[int, Tuple] = {}
     loops: List[int] = []
     pending = []
+    checks: List[Tuple[int, Any]] = []
+    scanned: set = set()
 
     def new_loop(extent: int) -> int:
         loops.append(extent)
@@ -148,15 +159,18 @@ def solve(view) -> Schedule:
     used = set()
     for g, e in exprs.items():
         if isinstance(e, Var):
-            if e.k in recipes:
-                raise NotImplementedError(f"t{e.k} drives two grid axes")
-            recipes[e.k] = ("x", g)
+            if e.k in recipes:                       # same coordinate on two axes: the second is a check
+                checks.append((g, e))
+            else:
+                recipes[e.k] = ("x", g)
             used.add(g)
     for g1, e1 in fdiv.items():
         k, q = e1.a.k, e1.k
         g2 = next((g for g, e in mods.items() if e.a.k == k and e.k == q and g not in used), None)
-        if k in recipes:
-            raise NotImplementedError(f"t{k} constrained twice")
+        if k in recipes:                             # already fixed: this axis is a consistency check
+            checks.append((g1, e1))
+            used.add(g1)
+            continue
         if g2 is not None:
             recipes[k] = ("pair", g1, q, g2)
             used |= {g1, g2}
@@ -168,16 +182,20 @@ def solve(view) -> Schedule:
         if g in used:
             continue
         lin = _linear(e.a) if isinstance(e, Mod) else None
-        if lin is None:
-            raise NotImplementedError(f"cannot invert g{g} = {e} (supported: t, t floordiv q, (linear) mod P)")
+        if lin is None:                              # no closed form: scan its free coordinates, check per trip
+            checks.append((g, e))
+            scanned |= {k for k in e.vars() if k not in recipes}
+            used.add(g)
+            continue
         coeffs, c = lin
         P = e.k
         unit = [k for k, a in coeffs.items() if a in (1, -1) and k not in recipes]
         inv = [k for k, a in coeffs.items() if k not in recipes and gcd(a % P, P) == 1]
-        if not (unit or inv):
-            raise NotImplementedError(
-                f"cannot invert g{g} = {e}: no free coordinate whose coefficient is invertible mod {P} "
-                f"(gcd > 1 leaves some PEs without pieces; that needs a guarded scan or a lookup table)")
+        if not (unit or inv):                        # fixed already (a check) or gcd > 1 (a guarded scan)
+            checks.append((g, e))
+            scanned |= {k for k in coeffs if k not in recipes}
+            used.add(g)
+            continue
         j = max(unit) if unit else max(inv)             # prefer ±1; the last free coordinate keeps row-major order
         a = coeffs[j]
         m = a if a in (1, -1) else pow(a % P, -1, P)
@@ -198,7 +216,8 @@ def solve(view) -> Schedule:
             g, j, rest, c, m, P = next(p for p in pending if p[1] == k)
             loop_of[k] = new_loop(-(-num[k] // P))      # ceil: the PEs with fewer pieces skip the last trip
             recipes[k] = ("pivot", g, rest, c, m, P, loop_of[k])
-    sched = Schedule(loops, recipes, ncomp)
+    sched = Schedule(loops, recipes, ncomp, checks=tuple(checks),
+                     scanned=tuple(sorted(k for k in scanned if recipes[k][0] == "loop")))
     # a coordinate that can run past its extent on some PE gets a per-trip guard t_k < n_k
     over = set()
     for pe in view.grid.coords():
@@ -223,8 +242,25 @@ def _verify(view, sched: Schedule) -> None:
         slots = [s for s, _ in got]
         if len(set(slots)) != len(slots) or not all(0 <= s < sched.slots for s in slots):
             raise AssertionError("slots are not distinct")
-        if not sched.guards and len(slots) != sched.slots:
+        if not sched.guards and not sched.checks and len(slots) != sched.slots:
             raise AssertionError("unguarded schedule leaves slots empty")
+
+
+def _eval(e: Any, t: Sequence[Any]) -> Any:
+    """Evaluate an owner expression on symbolic or concrete piece coordinates."""
+    if isinstance(e, Var):
+        return t[e.k]
+    if isinstance(e, Const):
+        return e.k
+    if isinstance(e, Add):
+        return _eval(e.a, t) + _eval(e.b, t)
+    if isinstance(e, Mul):
+        return _eval(e.a, t) * e.k
+    if isinstance(e, FloorDiv):
+        return _eval(e.a, t) // e.k
+    if isinstance(e, Mod):
+        return _eval(e.a, t) % e.k
+    raise TypeError(e)
 
 
 def is_placement(view) -> bool:
@@ -275,6 +311,11 @@ class Text:
 
     def __floordiv__(self, k: int) -> "Text":
         return Text({}, 0, f"{self._paren()} // {k}")
+
+    def __eq__(self, o: Any) -> str:          # type: ignore[override]  # printable branch condition
+        return f"{self} == {o}"
+
+    __hash__ = object.__hash__
 
     def __le__(self, o: Any) -> str:          # printable branch conditions
         return f"{self} <= {o}"
