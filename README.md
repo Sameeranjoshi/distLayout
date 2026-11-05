@@ -53,11 +53,23 @@ with air.herd(air_backend.herd_space(view), shape=(2,)) as h:
 python3 -m pytest -q
 ```
 
-The AIR-adapter tests build herd coordinates with upstream's real `air.api` `IndexExpr` (`python/air/api/_index.py`, which is pure Python). They look for a checkout in `$MLIR_AIR_SRC` or `~/xilinx/mlir-air`. They check the exact affine subscripts passed to `air.ops.load`/`store`, and use recording fakes for buffers and ops.
+- **Core tests** need no dependencies.
+- **AIR-adapter tests** build herd coordinates with upstream's real `IndexExpr` (`python/air/api/_index.py`, plain Python). They look for a checkout in `$MLIR_AIR_SRC` or `~/xilinx/mlir-air`.
+- **`tests/test_air_real.py`** runs against real MLIR-AIR and is skipped when it isn't installed. It checks:
+  - `examples/eltwise_add_with_l2_dist.py` builds an MLIR module **byte-identical** to upstream's handwritten `eltwise_add_with_l2`, at three sizes.
+  - Replication and a 2-D block layout build valid modules.
+
+The prebuilt wheel works with no compiler build:
+
+```bash
+pip install --no-deps mlir_air-0.0.1.2026100604+94f274f-cp313-cp313-linux_x86_64.whl numpy ml_dtypes filelock==3.13.1
+```
+
+(from `https://github.com/Xilinx/mlir-air/releases/download/latest-air-wheels/`; the `[aie]` extra, i.e. mlir_aie and llvm-aie, is only needed to compile for the NPU.)
 
 ## Status and limits
 
-- **Not yet run through a real MLIR-AIR build.** Compiled AIR bindings weren't available where this was written. Next check: `python3 examples/eltwise_add_with_l2_dist.py -p` should print the same module as upstream's example.
+- **Checked against real `air.api` up to the emitted MLIR, not yet compiled or run on an NPU.** That needs the `[aie]` extra and hardware/XRT.
 - **The AIR backend emits uniform layouts only.** `air.api` needs one static transfer size, and uneven layouts give PEs different sizes. `plan()` describes them exactly. Emitting them needs `air.ops.branch` or a padded L2 source.
 - **One partition per PE along each placed axis.** Cyclic layouts and overdecomposition come later.
 - **The partial-source binding works only within its window.** A `DataSource` with `origin` gives correct offsets for PEs whose region lies in the window. Decomposing *the window itself* (an MPI rank's piece split k ways) is the next feature, needed for rank splitting.
