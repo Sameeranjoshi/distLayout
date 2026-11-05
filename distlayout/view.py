@@ -321,6 +321,9 @@ class DistributedView:
         if pm is not None:
             place = ", ".join(f"{k} -> g{g}" for k, g in pm.place)
             return head + f"place = [{place}], replicate = [{rep}]>"
+        from .mapping import TableMap
+        if isinstance(self.mapping, TableMap):
+            return head + f"owner = table<{self.mapping.linear()}>, replicate = [{rep}]>"
         owner = ", ".join(f"g{g} = {e}" for g, e in sorted(self.mapping.exprs().items()))
         return head + f"owner = [{owner}], replicate = [{rep}]>"
 

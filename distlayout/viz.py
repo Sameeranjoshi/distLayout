@@ -248,7 +248,7 @@ def _traced_code(view: DistributedView, names: List[str], src: str, dtype: str, 
 
 def to_spec(view: DistributedView, title: str = "", note: str = "", halo: int = 0,
             mlir: Optional[str] = None, src: str = "l2", elem_bytes: int = 4,
-            pe_kib: float = 48) -> Dict[str, Any]:
+            pe_kib: float = 48, pattern: Any = None, positions: Optional[Sequence[Tuple[int, int]]] = None) -> Dict[str, Any]:
     """The JSON the page understands. Raises for layouts the page cannot draw.
 
     Cuts are listed in tensor-axis order (as the builder shows them); owner
@@ -274,7 +274,9 @@ def to_spec(view: DistributedView, title: str = "", note: str = "", halo: int = 
             cuts.append(c)
         else:
             raise NotImplementedError(f"the explorer cannot draw {r!r}")
-    exprs = view.mapping.exprs()
+    from .mapping import TableMap
+    table = isinstance(view.mapping, TableMap)
+    exprs = {} if table else view.mapping.exprs()
     mapping: List[Optional[str]] = [None] * view.grid.rank
     for g, e in exprs.items():
         for old in range(len(rules)):                      # two-phase renumbering avoids collisions
@@ -284,6 +286,17 @@ def to_spec(view: DistributedView, title: str = "", note: str = "", halo: int = 
         mapping[g] = str(e)
     spec = {"title": title, "note": note, "shape": list(view.shape), "grid": list(view.grid.shape),
             "cuts": cuts, "map": mapping, "halo": halo, "bytes": elem_bytes, "kib": pe_kib, "src": src}
+    if table:
+        spec["table"], spec["rep"] = view.mapping.linear(), list(view.mapping.replicate)
+    if pattern is not None:                      # irregular access: ghosts and imports from the inspector
+        from .irregular import inspect
+        sched = inspect(view, pattern)
+        ix = {pe: k for k, pe in enumerate(view.grid.coords())}
+        spec["ghosts"] = [len(sched[pe].ghosts) for pe in view.grid.coords()]
+        spec["imports"] = [[ix[pe], ix[src], len(ids)] for pe, pl in sched.items() for src, ids in pl.imports.items()]
+        if positions is not None:
+            spec["graph"] = {"pos": [list(map(int, q)) for q in positions],
+                             "edges": [[i, j] for i in range(pattern.nrows) for j in pattern.row(i) if i < j]}
     if mlir:
         spec["mlir"] = mlir
     if (halo or not view.is_uniform()
@@ -417,30 +430,41 @@ function build(spec){
     const sz=sizesOf(c,shape[c.axis]);if(sz.some(s=>s<1))throw new Error(`axis ${c.axis}: ${c.parts} pieces leave an empty piece`);
     const st=[0];sz.forEach(s=>st.push(st[st.length-1]+s));return {axis:c.axis,c,sizes:sz,starts:st}});
   const counts=rules.map(r=>r.sizes.length), ncomp=rules.length;
-  const exprs=grid.map((n,g)=>{const s=(spec.map[g]||"").trim();if(!s)return null;
+  const table=spec.table||null;
+  const exprs=grid.map((n,g)=>{const s=table?"":(spec.map[g]||"").trim();if(!s)return null;
     let e;try{e=parseExpr(s)}catch(err){throw new Error(`g${g}: ${err.message}`)}
     const bad=varsE(e).filter(k=>k>=ncomp);if(bad.length)throw new Error(`g${g} = ${strE(e)} uses t${bad[0]}, but pieces have ${ncomp} coordinate${ncomp===1?"":"s"}`);return e});
-  const replicate=[...Array(G).keys()].filter(g=>!exprs[g]);
+  const replicate=table?(spec.rep||[]).slice():[...Array(G).keys()].filter(g=>!exprs[g]);
   const pids=prod(counts.map(n=>[...Array(n).keys()]));
+  const npe=grid.reduce((a,b)=>a*b,1);
+  if(table){if(ncomp!==1)throw new Error("an owner table needs a single cut (pieces = runs of ids)");
+    if(table.length!==pids.length)throw new Error(`the owner table has ${table.length} entries for ${pids.length} pieces: it came from an owner array in Python (owner_array), so edit it there`);
+    if(table.some(t=>!(t>=0&&t<npe)))throw new Error("owner table names a PE outside the grid")}
   pids.forEach(pid=>exprs.forEach((e,g)=>{if(!e)return;const v=evalE(e,pid);if(!(v>=0&&v<grid[g]))throw new Error(`piece (${pid}): g${g} = ${strE(e)} = ${v}, outside grid axis of ${grid[g]} PEs`)}));
   const region=pid=>{const lo=shape.map(()=>0),hi=shape.slice();rules.forEach((r,k)=>{lo[r.axis]=r.starts[pid[k]];hi[r.axis]=r.starts[pid[k]+1]});return{lo,hi}};
   const partOf=idx=>rules.map(r=>{let p=0;while(idx[r.axis]>=r.starts[p+1])p++;return p});
   const pidIx=pid=>pid.reduce((a,p,k)=>a*counts[k]+p,0);
   const peIx=c=>c.reduce((a,v,g)=>a*grid[g]+v,0);
   const pes=prod(grid.map(n=>[...Array(n).keys()]));
-  const primaryOf=pid=>grid.map((n,g)=>exprs[g]?evalE(exprs[g],pid):0);
-  const holdersOf=pid=>{const b=primaryOf(pid);return pes.filter(pe=>pe.every((v,g)=>exprs[g]?v===b[g]:true))};
+  const unl=ix=>{const c=[];for(let g=G-1;g>=0;g--){c.unshift(ix%grid[g]);ix=Math.floor(ix/grid[g])}return c};
+  const primaryOf=pid=>table?unl(table[pidIx(pid)]):grid.map((n,g)=>exprs[g]?evalE(exprs[g],pid):0);
+  const holdersOf=pid=>{const b=primaryOf(pid);return pes.filter(pe=>pe.every((v,g)=>replicate.includes(g)?true:v===b[g]))};
   const isPrimary=pe=>replicate.every(g=>pe[g]===0);
   const at={};pes.forEach(pe=>at[peIx(pe)]=[]);pids.forEach(pid=>holdersOf(pid).forEach(h=>at[peIx(h)].push(pid)));
   const piecesAt=pe=>at[peIx(pe)];
   const maxPieces=Math.max(0,...Object.values(at).map(v=>v.length));
   const uniform=rules.every(r=>new Set(r.sizes).size===1);
   // placement-shaped owner map? (each expr a distinct bare t_k, one piece per PE along it)
-  const bare=exprs.filter(Boolean);
-  const placement=bare.every(e=>e.t==="var")&&bare.map(e=>e.k).sort().join()===[...Array(ncomp).keys()].join()&&exprs.every((e,g)=>!e||counts[e.k]===grid[g]);
+  let place=null;
+  if(table){const free=[...Array(G).keys()].filter(g=>!replicate.includes(g));
+    if(ncomp===1&&free.length===1&&grid[free[0]]===counts[0]&&table.every((t,k)=>unl(t)[free[0]]===k))place=[[0,free[0]]]}
+  else{const bare=exprs.filter(Boolean);
+    if(bare.every(e=>e.t==="var")&&bare.map(e=>e.k).sort().join()===[...Array(ncomp).keys()].join()&&exprs.every((e,g)=>!e||counts[e.k]===grid[g]))
+      place=exprs.map((e,g)=>e?[e.k,g]:null).filter(Boolean).sort((a,b)=>a[0]-b[0])}
+  const placement=!!place;
   // owner-PE colors: distinct primaries in PE order
   const prim=[...new Set(pids.map(pid=>peIx(primaryOf(pid))))].sort((a,b)=>a-b), primRank={};prim.forEach((p,i)=>primRank[p]=i);
-  return {spec,shape,grid,rules,counts,exprs,replicate,pids,region,partOf,pidIx,peIx,pes,primaryOf,holdersOf,isPrimary,piecesAt,maxPieces,uniform,placement,prim,primRank};
+  return {spec,shape,grid,rules,counts,exprs,table,replicate,pids,region,partOf,pidIx,peIx,pes,primaryOf,holdersOf,isPrimary,piecesAt,maxPieces,uniform,placement,place,prim,primRank};
 }
 function inter(a,b){const lo=a.lo.map((v,i)=>Math.max(v,b.lo[i])),hi=a.hi.map((v,i)=>Math.min(v,b.hi[i]));return hi.every((v,i)=>v>lo[i])?{lo,hi}:null}
 function contains(a,b){return b.lo.every((v,i)=>v>=a.lo[i]&&b.hi[i]<=a.hi[i])}
@@ -463,6 +487,7 @@ function peColor(L,ix){  // color of an owner PE
 function primaryIxOfPe(L,pe){return L.peIx(pe.map((v,g)=>L.replicate.includes(g)?0:v))}
 
 // ---------- text ----------
+function brief(a){return a.length>12?`${a.slice(0,8).join(", ")}, … (${a.length} sizes)`:a.join(", ")}
 function pyTuple(a){return a.length===1?`(${a[0]},)`:`(${a.join(", ")})`}
 function ruleRepr(r){const c=r.c;if(c.kind==="block")return `Block(axis=${r.axis}, parts=${r.sizes.length})`;
   if(c.sizes)return `UnevenBlock(axis=${r.axis}, sizes=${pyTuple(c.sizes)})`;
@@ -471,21 +496,22 @@ function gridRepr(g){return g.length>1?`Grid(${pyTuple(g)})`:`Grid(${g[0]})`}
 function mappingRepr(L){
   const rep=L.replicate.length?`, replicate=[${L.replicate.join(", ")}]`:"";
   if(L.placement){if(!L.rules.length&&L.replicate.length===L.grid.length)return `Replicate(${gridRepr(L.grid)})`;
-    const pl=L.exprs.map((e,g)=>e?[e.k,g]:null).filter(Boolean).sort((a,b)=>a[0]-b[0]);
-    return `Map(${gridRepr(L.grid)}, {${pl.map(([k,g])=>`${k}: ${g}`).join(", ")}}${rep})`}
+    return `Map(${gridRepr(L.grid)}, {${L.place.map(([k,g])=>`${k}: ${g}`).join(", ")}}${rep})`}
+  if(L.table)return `TableMap(${gridRepr(L.grid)}, [${L.table.join(", ")}]${rep})`;
   return `OwnerMap(${gridRepr(L.grid)}, {${L.exprs.map((e,g)=>e?`${g}: '${strE(e)}'`:null).filter(Boolean).join(", ")}}${rep})`}
 function pyText(L){return `view = bind(${L.spec.src||"l2"}, Decomposition(${L.rules.map(ruleRepr).join(", ")}), ${mappingRepr(L)})`}
 function attrText(L){
   const rr=L.rules.map(r=>r.c.kind==="block"?`block<axis = ${r.axis}, parts = ${r.sizes.length}>`:
     r.c.sizes?`uneven<axis = ${r.axis}, sizes = [${r.c.sizes.join(", ")}]>`:`uneven<axis = ${r.axis}, parts = ${r.sizes.length}, policy = ${r.c.policy||"balanced"}>`).join(", ");
   const head=`#dist.layout<shape = [${L.shape.join(", ")}], grid = [${L.grid.join(", ")}], decomp = [${rr}], `, rep=`replicate = [${L.replicate.map(g=>"g"+g).join(", ")}]>`;
-  if(L.placement){const pl=L.exprs.map((e,g)=>e?[e.k,g]:null).filter(Boolean).sort((a,b)=>a[0]-b[0]);return head+`place = [${pl.map(([k,g])=>`${k} -> g${g}`).join(", ")}], `+rep}
+  if(L.placement)return head+`place = [${L.place.map(([k,g])=>`${k} -> g${g}`).join(", ")}], `+rep;
+  if(L.table)return head+`owner = table<[${L.table.join(", ")}]>, `+rep;
   return head+`owner = [${L.exprs.map((e,g)=>e?`g${g} = ${strE(e)}`:null).filter(Boolean).join(", ")}], `+rep}
 function airText(L){
   if(!L.placement||!L.uniform||(+L.spec.halo||0)>0)return cur.air||"# This layout is emitted with loops (owner maps) or one branch per size class\n# (uneven, halo), which the Python backend computes: air_backend.for_each_piece /\n# halo_load. python3 examples/gallery.py embeds the emitted code for each preset;\n# editing the layout here drops it.";
-  const names=["tx","ty","tz"].slice(0,L.grid.length), src=L.spec.src||"l2", gOf=k=>L.exprs.findIndex(e=>e&&e.k===k);
+  const names=["tx","ty","tz"].slice(0,L.grid.length), src=L.spec.src||"l2", gOf=k=>(L.place.find(p=>p[0]===k)||[0,-1])[1];
   const sub=L.shape.map((n,a)=>{const k=L.rules.findIndex(r=>r.axis===a);if(k<0)return `0 : ${n}`;const b=L.rules[k].sizes[0],c=names[gOf(k)];return `${c}*${b} : ${c}*${b} + ${b}`}).join(", ");
-  const herd=L.grid.map((n,g)=>{const e=L.exprs[g];if(!e)return `range(${n})`;const r=L.rules[e.k];return `range(0, ${L.shape[r.axis]}, ${r.sizes[0]})`}).join(", ");
+  const herd=L.grid.map((n,g)=>{const p=L.place.find(p=>p[1]===g);if(!p)return `range(${n})`;const r=L.rules[p[0]];return `range(0, ${L.shape[r.axis]}, ${r.sizes[0]})`}).join(", ");
   const loc=L.shape.map((n,a)=>{const r=L.rules.find(r=>r.axis===a);return r?r.sizes[0]:n});
   const rep=L.replicate.filter(g=>L.grid[g]>1).map(g=>names[g]);
   return `with air.herd([${herd}]) as h:\n  @h.body\n  def _(${names.join(", ")}):\n    a = air.alloc([${loc.join(", ")}], f32, scope=h.private())\n    air.ops.load(a, ${src}[${sub}])`+
@@ -493,14 +519,14 @@ function airText(L){
     `\n\n# with distlayout:\n#   a = air_backend.alloc_local(view, f32, scope=h.private())\n#   air_backend.load_local(view, a, (${names.join(", ")}${names.length===1?",":""}))`}
 function formula(L,idx){
   const pid=L.partOf(idx);
-  const cut=L.rules.map((r,k)=>r.c.kind==="block"?`t${k} = i${r.axis} // ${r.sizes[0]} = ${pid[k]}`:`t${k} = piece of i${r.axis} in [${r.sizes.join(", ")}] = ${pid[k]}`);
-  const map=L.exprs.map((e,g)=>e?`g${g} = ${strE(e)} = ${evalE(e,pid)}`:null).filter(Boolean);
+  const cut=L.rules.map((r,k)=>r.c.kind==="block"?`t${k} = i${r.axis} // ${r.sizes[0]} = ${pid[k]}`:`t${k} = piece of i${r.axis} in [${brief(r.sizes)}] = ${pid[k]}`);
+  const map=L.table?[`table[${L.pidIx(pid)}] = PE ${L.table[L.pidIx(pid)]}`]:L.exprs.map((e,g)=>e?`g${g} = ${strE(e)} = ${evalE(e,pid)}`:null).filter(Boolean);
   const pe=L.primaryOf(pid), hs=L.holdersOf(pid);
   return `element (${idx.join(", ")}): ${cut.join("; ")||"one piece"} → ${pname(pid)} → ${map.join("; ")||"(replicated)"} → PE ${L.peIx(pe)}`+(hs.length>1?`, held by ${hs.length} PEs`:"");
 }
 function hint(L){
-  const cut=L.rules.map((r,k)=>r.c.kind==="block"?`t${k} = i${r.axis} // ${r.sizes[0]}`:`t${k} from sizes [${r.sizes.join(", ")}]`).join(", ");
-  const map=L.exprs.map((e,g)=>e?`g${g} = ${strE(e)}`:null).filter(Boolean).join(", ");
+  const cut=L.rules.map((r,k)=>r.c.kind==="block"?`t${k} = i${r.axis} // ${r.sizes[0]}`:`t${k} from sizes [${brief(r.sizes)}]`).join(", ");
+  const map=L.table?`owner table over ${L.table.length} runs`:L.exprs.map((e,g)=>e?`g${g} = ${strE(e)}`:null).filter(Boolean).join(", ");
   const rr=L.replicate.filter(g=>L.grid[g]>1);
   return `hover an element · cut: ${cut||"none"} · map: ${map||"none"}`+(rr.length?` · replicated over ${rr.map(g=>"g"+g).join(", ")}`:"");
 }
@@ -525,7 +551,7 @@ function draw(L){
     else{const y=ty0+fy(v)+.5;s+=`<line x1="0" y1="${y}" x2="${tw0}" y2="${y}" stroke="${ink}" stroke-width="${dense?.6:1.4}" stroke-dasharray="${dense?"2 2":"5 3"}"/>`}})});
   L.pids.forEach(pid=>{const r=L.region(pid);const x1=fx(rank===1?r.lo[0]:r.lo[1]),x2=fx(rank===1?r.hi[0]:r.hi[1]),y1=rank===1?0:fy(r.lo[0]),y2=rank===1?th0:fy(r.hi[0]);
     const lab=pname(pid);if(x2-x1>=lab.length*6.5&&y2-y1>=14)s+=`<text x="${(x1+x2)/2}" y="${ty0+(y1+y2)/2+4}" font-size="11" fill="${muted}" text-anchor="middle">${lab}</text>`});
-  const rulesTxt=L.rules.length?L.rules.map((r,k)=>`t${k}: ${ruleRepr(r)}`):["no cut: one piece"];
+  const rulesTxt=L.rules.length?L.rules.map((r,k)=>r.c.sizes&&r.c.sizes.length>12?`t${k}: UnevenBlock(axis=${r.axis}, ${r.c.sizes.length} runs)`:`t${k}: ${ruleRepr(r)}`):["no cut: one piece"];
   if(!toScale)rulesTxt.push("(not to scale)");
   rulesTxt.forEach((t,k)=>s+=sub(0,ty0+th0+18+k*15,t));
   const tBottom=ty0+th0+18+(rulesTxt.length-1)*15;
@@ -559,10 +585,12 @@ function draw(L){
   s+=cap(0,py-14,`③ Map: grid ${G.join(" × ")}`)+sub(150,py-14,`pieces held, memory used${halo?` (with halo ${h})`:h?" (halo shown for one-piece PEs only)":""}${rr.length?`; replicated over ${rr.map(g=>"g"+g).join(", ")}`:""}`);
   const pos={};let maxB=0,over=0;
   L.pes.forEach(pe=>{const i=L.peIx(pe),row=G.length>1?Math.floor(i/gc):0,col=i%gc,x=col*(bw+bg),y=py+row*(bh+bg);pos[i]=[x+bw/2,y+bh/2];
-    const ps=L.piecesAt(pe),pl=halo?plan(L,pe,h):null,b=(pl?vol(pl.req):ps.reduce((a,p)=>a+vol(L.region(p)),0))*bytes;maxB=Math.max(maxB,b);if(b>budget)over++;
+    const gh=L.spec.ghosts?L.spec.ghosts[i]:0;
+    const ps=L.piecesAt(pe),pl=halo?plan(L,pe,h):null,b=((pl?vol(pl.req):ps.reduce((a,p)=>a+vol(L.region(p)),0))+gh)*bytes;maxB=Math.max(maxB,b);if(b>budget)over++;
     const frac=Math.min(1,b/budget),own=primaryIxOfPe(L,pe),col2=ps.length?peColor(L,own):"#B9C4D2";
     const label=ps.length===0?"empty":ps.length===1?pname(ps[0]):ps.length<=3?ps.map(pname).join(" "):`${ps.length} pieces`;
-    const regs=ps.length===0?"—":ps.length===1?rstr(L.region(ps[0])):ps.slice(0,2).map(p=>rstr(L.region(p))).join(" ")+(ps.length>2?" …":"");
+    const owned=ps.reduce((a,p)=>a+vol(L.region(p)),0);
+    const regs=gh||ps.length>3?`${owned} owned${gh?` + ${gh} ghosts`:""}`:ps.length===0?"—":ps.length===1?rstr(L.region(ps[0])):ps.slice(0,2).map(p=>rstr(L.region(p))).join(" ")+(ps.length>2?" …":"");
     s+=`<g class="pe" data-o="${own}" data-pe="${i}"><rect x="${x}" y="${y}" width="${bw}" height="${bh}" rx="7" fill="${col2}" ${L.isPrimary(pe)?"":`fill-opacity=".55"`}/>`+
       `<text x="${x+8}" y="${y+16}" font-size="12" font-weight="700" fill="#fff">PE ${i} ← ${label}${L.isPrimary(pe)?"":" · replica"}</text>`+
       `<text x="${x+8}" y="${y+31}" font-size="10.5" fill="#fff">${regs}</text>`+
@@ -573,17 +601,31 @@ function draw(L){
   let arrows="";const pair={};
   if(halo)L.pes.forEach(pe=>{const dst=L.peIx(pe),pl=plan(L,pe,h);if(!pl)return;pl.pieces.filter(p=>!p.local).forEach(p=>{const a=Math.min(p.src,dst),b=Math.max(p.src,dst),k=a+"-"+b;
     pair[k]=pair[k]||{a,b,n:0,dirs:new Set()};pair[k].n+=vol(p.r);pair[k].dirs.add(p.src===a?"ab":"ba")})});
+  if(!halo&&L.spec.imports)L.spec.imports.forEach(([dst,src,n])=>{const a=Math.min(src,dst),b=Math.max(src,dst),k=a+"-"+b;
+    pair[k]=pair[k]||{a,b,n:0,dirs:new Set()};pair[k].n+=n;pair[k].dirs.add(src===a?"ab":"ba")});
   const edge=(x,y,dx,dy)=>{const t=Math.min(Math.abs(dx)>1e-9?(bw/2+4)/Math.abs(dx):1e9,Math.abs(dy)>1e-9?(bh/2+4)/Math.abs(dy):1e9);return [x+dx*t,y+dy*t]};
-  Object.values(pair).forEach(({a,b,n,dirs})=>{const [x1,y1]=pos[a],[x2,y2]=pos[b],dx=x2-x1,dy=y2-y1;
+  const arcs=!halo&&!!L.spec.imports&&G.length===1;let arcDepth=0;
+  if(arcs)Object.values(pair).forEach(({a,b,n,dirs})=>{const [x1,y1]=pos[a],[x2]=pos[b],yb=y1+bh/2+3,d=14+12*Math.abs(b-a);arcDepth=Math.max(arcDepth,d);
+    arrows+=`<path d="M${x1},${yb} Q${(x1+x2)/2},${yb+2*d} ${x2},${yb}" fill="none" stroke="#D95455" stroke-width="${Math.min(3,1+n/12)}" ${dirs.has("ab")?'marker-end="url(#ah)"':""} ${dirs.has("ba")?'marker-start="url(#ah2)"':""}><title>PE ${a} ⇄ PE ${b}: ${n} ghost elements</title></path>`});
+  else Object.values(pair).forEach(({a,b,n,dirs})=>{const [x1,y1]=pos[a],[x2,y2]=pos[b],dx=x2-x1,dy=y2-y1;
     const [sx,sy]=edge(x1,y1,dx,dy),[ex,ey]=edge(x2,y2,-dx,-dy),diag=Math.abs(dx)>1&&Math.abs(dy)>1;
-    arrows+=`<line x1="${sx}" y1="${sy}" x2="${ex}" y2="${ey}" stroke="#D95455" stroke-width="${diag?1.2:2.2}" ${diag?'stroke-dasharray="4 3"':""} ${dirs.has("ab")?'marker-end="url(#ah)"':""} ${dirs.has("ba")?'marker-start="url(#ah2)"':""}><title>PE ${a} ⇄ PE ${b}: ${n} halo elements</title></line>`});
-  const H=py+gr*(bh+bg)+4, PW=Math.max(X0+tw,gc*(bw+bg),TW);
+    arrows+=`<line x1="${sx}" y1="${sy}" x2="${ex}" y2="${ey}" stroke="#D95455" stroke-width="${diag?1.2:2.2}" ${diag?'stroke-dasharray="4 3"':""} ${dirs.has("ab")?'marker-end="url(#ah)"':""} ${dirs.has("ba")?'marker-start="url(#ah2)"':""}><title>PE ${a} ⇄ PE ${b}: ${n} ${halo?"halo":"ghost"} elements</title></line>`});
+  let H=py+gr*(bh+bg)+4+arcDepth, PW=Math.max(X0+tw,gc*(bw+bg),TW);
+  // ④ graph view: mesh nodes at their positions, colored by owner; cut edges dashed red
+  const gv=L.spec.graph;
+  if(gv&&rank===1){const P=gv.pos,mx=Math.max(...P.map(p=>p[0])),my=Math.max(...P.map(p=>p[1])),sp=Math.max(14,Math.min(34,Math.floor((W-20)/(my+1)))),gy=H+46;
+    const own=P.map((_,id)=>L.peIx(L.primaryOf(L.partOf([id])))),X=id=>10+P[id][1]*sp,Y=id=>gy+P[id][0]*sp;
+    let cutN=0,es="";gv.edges.forEach(([u,v])=>{const cut=own[u]!==own[v];if(cut)cutN++;
+      es+=`<line x1="${X(u)}" y1="${Y(u)}" x2="${X(v)}" y2="${Y(v)}" stroke="${cut?"#D95455":"var(--line)"}" stroke-width="${cut?1.6:1.2}" ${cut?'stroke-dasharray="4 3"':""}/>`});
+    s+=cap(0,gy-24,"④ Graph: each id at its mesh position, colored by owner")+sub(330,gy-24,`dashed red = cut edges (${cutN}): every one is a ghost read`)+es;
+    P.forEach((_,id)=>{s+=`<circle class="el" data-i="${id}" data-o="${own[id]}" cx="${X(id)}" cy="${Y(id)}" r="${Math.max(4,sp*0.28)}" fill="${peColor(L,own[id])}" stroke="var(--bg)" stroke-width="1.2"><title>id ${id} → PE ${own[id]}</title></circle>`});
+    H=gy+mx*sp+20;PW=Math.max(PW,20+my*sp)}
   const mk=(id,d,rx)=>`<marker id="${id}" viewBox="0 0 10 10" refX="${rx}" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="${d}" fill="${id==="ahm"?"#52657B":"#D95455"}"/></marker>`;
   $("pic").innerHTML=`<div style="overflow-x:auto"><svg xmlns="http://www.w3.org/2000/svg" width="${PW}" height="${H}" viewBox="0 0 ${PW} ${H}"><defs>${mk("ah","M0,0L10,5L0,10z",8)}${mk("ah2","M10,0L0,5L10,10z",2)}${mk("ahm","M0,0L10,5L0,10z",8)}</defs>${s}${arrows}</svg></div>`;
   // legend & stats
   const byOwner={};L.pids.forEach(pid=>{const o=L.peIx(L.primaryOf(pid));(byOwner[o]=byOwner[o]||[]).push(pid)});
   $("legend").innerHTML=L.prim.slice(0,12).map(o=>{const ps=byOwner[o],hs=L.holdersOf(ps[0]).length;
-    return `<span><i class="sw" style="background:${peColor(L,o)}"></i>PE ${o} ← ${ps.length<=3?ps.map(pname).join(", "):ps.length+" pieces"}${hs>1?` +${hs-1} replica${hs>2?"s":""}`:""}</span>`}).join("")+(L.prim.length>12?`<span>… ${L.prim.length-12} more</span>`:"")+(halo?`<span><i class="sw" style="background:#D95455"></i>halo import</span>`:"");
+    return `<span><i class="sw" style="background:${peColor(L,o)}"></i>PE ${o} ← ${ps.length<=3?ps.map(pname).join(", "):ps.length+" pieces"}${hs>1?` +${hs-1} replica${hs>2?"s":""}`:""}</span>`}).join("")+(L.prim.length>12?`<span>… ${L.prim.length-12} more</span>`:"")+(halo?`<span><i class="sw" style="background:#D95455"></i>halo import</span>`:"")+(L.spec.imports?`<span><i class="sw" style="background:#D95455"></i>ghost import (${L.spec.imports.reduce((a,x)=>a+x[2],0)} ids)</span>`:"");
   L.maxB=maxB;
   const fit=over?`<b style="color:var(--comm)">${over} PE${over>1?"s":""} over budget</b>`:`<b style="color:var(--ok)">fits</b>`;
   $("stat").innerHTML=`max ${fmtB(maxB)} / PE of ${fmtB(budget)} · ${fit}`+(pinned?` · vs A (${pinned.name}): ${fmtB(pinned.maxB)} / PE → ${maxB<=pinned.maxB?(pinned.maxB/maxB).toFixed(2)+"× less":(maxB/pinned.maxB).toFixed(2)+"× more"}`:"");
@@ -605,9 +647,10 @@ function syncForm(){
   box.querySelectorAll("select").forEach(sel=>sel.onchange=()=>{const a=+sel.dataset.a,k=sel.value;cur.cuts=cur.cuts.filter(c=>c.axis!==a);
     if(k!=="whole"){const ncut=cur.cuts.length;cur.cuts.push({axis:a,kind:k,parts:cur.grid[Math.min(ncut,cur.grid.length-1)]||2,policy:"balanced"});cur.cuts.sort((x,y)=>x.axis-y.axis);
       const k2=cur.cuts.findIndex(c=>c.axis===a),g=Math.min(k2,cur.grid.length-1);if(!(cur.map[g]||"").trim())cur.map[g]="t"+k2}
-    delete cur.mlir;delete cur.air;syncForm();render()});
+    delete cur.mlir;delete cur.air;delete cur.imports;delete cur.ghosts;syncForm();render()});
   box.querySelectorAll("input").forEach(inp=>inp.oninput=()=>{const c=cur.cuts.find(c=>c.axis===+inp.dataset.p);if(c){c.parts=+inp.value;delete c.sizes;delete cur.mlir;delete cur.air;render()}});
   const mb=$("maps");mb.innerHTML="";
+  if(cur.table){mb.innerHTML=`<p class="help">Owner table (irregular): piece k → PE table[k], from <code>owner_array(owner)</code> in Python. ${cur.table.length} runs.</p>`;return}
   cur.grid.forEach((n,g)=>mb.insertAdjacentHTML("beforeend",`<label>Grid axis g${g} (${n} PEs)</label><input class="mono" data-g="${g}" value="${(cur.map[g]||"").replace(/"/g,"&quot;")}" placeholder="replicated">`));
   mb.querySelectorAll("input").forEach(inp=>inp.oninput=()=>{cur.map[+inp.dataset.g]=inp.value;delete cur.mlir;delete cur.air;render()});
 }

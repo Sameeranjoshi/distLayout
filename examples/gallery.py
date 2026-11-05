@@ -11,8 +11,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import random  # noqa: E402
+
 from distlayout import (Block, Decomposition, Grid, Map, OwnerMap, Replicate, UnevenBlock, bind,  # noqa: E402
-                        block_cyclic, cyclic, refine, skew)
+                        bfs_partition, block_cyclic, block_partition, cyclic, grid_graph, owner_array, refine,
+                        renumber, skew)
+from distlayout.irregular import grid_positions  # noqa: E402
 from distlayout.viz import render_explorer  # noqa: E402
 
 
@@ -38,6 +42,12 @@ def eltwise_mlir(n, tile):
 def presets():
     g41 = Grid((4, 1))
     rank_view = bind(Buf(8, 4096), Decomposition(Block(0, 8)), Map(Grid(8), {0: 0}))
+    scramble = list(range(64))
+    random.Random(1).shuffle(scramble)
+    mesh, mesh_pos = grid_graph(8, 8, scramble), grid_positions(8, 8, scramble)
+    bfs_owner = bfs_partition(mesh, 4)
+    perm, renum_owner = renumber(bfs_owner)
+    renum_mesh, renum_pos = mesh.permute(perm), [mesh_pos[old] for old in perm]
     v2 = bind(Buf(16, 32), Decomposition(Block(0, 2), Block(1, 2)), Map(Grid((2, 2)), {0: 0, 1: 1}))
     n, tile = 2048, 256
     return [
@@ -74,6 +84,18 @@ def presets():
         ("Refine 1-D", refine(bind(Buf(64), Decomposition(Block(0, 4)), Map(Grid(4), {0: 0})), axis=0, k=2),
          {"note": "4 ranks of 16 elements, each refined 2 ways: g0 = t0 floordiv 2 (the rank), g1 = t0 mod 2 (the "
                   "slice). This is rank splitting written as an affine owner map."}),
+        ("Irregular: block of ids", bind(Buf(64), *owner_array(block_partition(64, 4))),
+         {"pattern": mesh, "positions": mesh_pos,
+          "note": "An 8 × 8 mesh whose ids are scrambled. Cutting the ids into 4 blocks looks tidy in the tensor "
+                  "but scatters every PE over the mesh (④): many cut edges, many ghosts."}),
+        ("Irregular: BFS partition", bind(Buf(64), *owner_array(bfs_owner)),
+         {"pattern": mesh, "positions": mesh_pos,
+          "note": "owner[i] from a graph partitioner (bfs_partition; METIS works the same way). The ids each PE owns "
+                  "are scattered (many pieces in ②), but on the mesh they are compact regions: far fewer ghosts."}),
+        ("Irregular: renumbered", bind(Buf(64), *owner_array(renum_owner)),
+         {"pattern": renum_mesh, "positions": renum_pos,
+          "note": "renumber(owner) permutes ids so each PE's are contiguous: the owner table becomes a placement "
+                  "(an uneven block, emittable to AIR) with the same ghosts as the BFS partition."}),
         ("eltwise_add", bind(Buf(n), Decomposition(Block(0, n // tile)), Map(Grid(n // tile), {0: 0})),
          {"src": "l2_a", "mlir": eltwise_mlir(n, tile),
           "note": f"Upstream eltwise_add_with_l2, n = {n}, tile = {tile}: one block per herd point. The MLIR tab "

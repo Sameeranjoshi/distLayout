@@ -9,15 +9,19 @@ The core has no dependencies. ``distlayout.backends.air`` lowers a view to
 
 from .decomposition import AxisRule, Block, Decomposition, UnevenBlock
 from .expr import parse, t
+from .irregular import (CSRPattern, GhostSchedule, bfs_partition, block_partition, grid_graph, inspect,
+                        owner_array, random_partition, renumber)
 from .layouts import block_cyclic, cyclic, refine, skew
-from .mapping import Grid, Map, Mapping, OwnerMap, Replicate
-from .region import Box
+from .mapping import Grid, Map, Mapping, OwnerMap, Replicate, TableMap
+from .region import Box, IndexSet
 from .view import DataSource, DistributedView, MaterializationPlan, Transfer, bind
 
 __all__ = [
     "AxisRule", "Block", "UnevenBlock", "Decomposition",
     "Grid", "Mapping", "Map", "Replicate", "OwnerMap", "t", "parse",
     "cyclic", "block_cyclic", "skew", "refine",
-    "Box",
+    "TableMap", "owner_array", "CSRPattern", "GhostSchedule", "inspect",
+    "block_partition", "random_partition", "bfs_partition", "renumber", "grid_graph",
+    "Box", "IndexSet",
     "DataSource", "DistributedView", "MaterializationPlan", "Transfer", "bind",
 ]

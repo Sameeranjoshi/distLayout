@@ -213,6 +213,91 @@ class OwnerMap:
         return f"OwnerMap({grid}, {ex}{rep})"
 
 
+@dataclass(frozen=True)
+class TableMap:
+    """Irregular mapping: piece ``k`` (row-major piece order) goes to PE ``table[k]``.
+
+    Entries are linear PE indices (row-major over the grid) or coordinate
+    tuples. Replicated grid axes work as for the other mappings: the table names
+    the primary (coordinate 0 there), every coordinate along them holds a copy.
+    Built from an owner array by :func:`distlayout.irregular.owner_array`.
+    """
+
+    grid: Grid
+    table: Tuple[Coord, ...]
+    replicate: Tuple[int, ...]
+
+    def __init__(self, grid: Grid, table: Sequence[Any], replicate: Sequence[int] = ()) -> None:
+        replicate = tuple(sorted(set(replicate)))
+        coords = []
+        for e in table:
+            c = _unlinear(int(e), grid.shape) if isinstance(e, int) else tuple(int(v) for v in e)
+            grid.check(c)
+            if any(c[g] != 0 for g in replicate):
+                raise ValueError(f"table entry {e}: coordinate on replicated axis must be 0 (the primary)")
+            coords.append(c)
+        for g in replicate:
+            if not 0 <= g < grid.rank:
+                raise ValueError(f"grid axis {g} outside rank-{grid.rank} grid")
+        object.__setattr__(self, "grid", grid)
+        object.__setattr__(self, "table", tuple(coords))
+        object.__setattr__(self, "replicate", replicate)
+
+    def check(self, num_parts: Tuple[int, ...]) -> None:
+        n = 1
+        for p in num_parts:
+            n *= p
+        if len(self.table) != n:
+            raise ValueError(f"table has {len(self.table)} entries for {n} pieces")
+
+    def _index(self, pid: Tuple[int, ...], num_parts: Optional[Tuple[int, ...]] = None) -> int:
+        if len(pid) == 1:
+            return pid[0]
+        raise NotImplementedError("TableMap with multi-component pieces: give pieces of one cut")
+
+    def pes_of(self, pid: Tuple[int, ...]) -> Tuple[Coord, Tuple[Coord, ...]]:
+        base = list(self.table[self._index(pid)])
+        primary = tuple(base)
+        holders = []
+        for rep in product(*(range(self.grid.shape[g]) for g in self.replicate)):
+            c = list(base)
+            for g, r in zip(self.replicate, rep):
+                c[g] = r
+            holders.append(tuple(c))
+        return primary, tuple(holders)
+
+    def is_primary(self, pe: Coord) -> bool:
+        return all(pe[g] == 0 for g in self.replicate)
+
+    def exprs(self) -> Dict[int, "Expr"]:
+        raise NotImplementedError("a TableMap has no owner expressions (it is a lookup table)")
+
+    def linear(self) -> List[int]:
+        """The table as linear PE indices."""
+        out = []
+        for c in self.table:
+            ix = 0
+            for v, s in zip(c, self.grid.shape):
+                ix = ix * s + v
+            out.append(ix)
+        return out
+
+    def __repr__(self) -> str:
+        rep = f", replicate={list(self.replicate)}" if self.replicate else ""
+        grid = f"Grid({tuple(self.grid.shape) if self.grid.rank > 1 else self.grid.shape[0]})"
+        return f"TableMap({grid}, {self.linear()}{rep})"
+
+
+def _unlinear(ix: int, shape: Sequence[int]) -> Coord:
+    out = []
+    for s in reversed(shape):
+        out.append(ix % s)
+        ix //= s
+    if ix:
+        raise IndexError("PE index outside grid")
+    return tuple(reversed(out))
+
+
 def as_placement(mapping: Any, num_parts: Sequence[int]) -> Optional[Mapping]:
     """``mapping`` as a plain placement ``Map`` when it is one.
 
@@ -223,6 +308,14 @@ def as_placement(mapping: Any, num_parts: Sequence[int]) -> Optional[Mapping]:
     """
     if isinstance(mapping, Mapping):
         return mapping
+    if isinstance(mapping, TableMap):           # identity table on one axis = a placement
+        free = [g for g in range(mapping.grid.rank) if g not in mapping.replicate]
+        if len(num_parts) != 1 or len(free) != 1 or mapping.grid.shape[free[0]] != num_parts[0]:
+            return None
+        g = free[0]
+        if all(c[g] == k for k, c in enumerate(mapping.table)):
+            return Mapping(mapping.grid, {0: g}, mapping.replicate)
+        return None
     from .expr import Var
     ex = mapping.exprs()
     if not all(isinstance(e, Var) for e in ex.values()):

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import product
-from typing import Iterator, Optional, Sequence, Tuple
+from typing import Iterator, List, Optional, Sequence, Tuple
 
 Index = Tuple[int, ...]
 
@@ -94,3 +94,101 @@ class Box:
 
     def __str__(self) -> str:
         return "[" + ", ".join(f"{a}:{b}" for a, b in zip(self.offset, self.stop)) + ")"
+
+
+class IndexSet:
+    """A set of ids on one axis, kept as sorted, merged half-open runs ``[(start, stop), ...]``.
+
+    The region kind of irregular layouts: owned ids, ghost ids, import lists.
+    Mostly-contiguous sets (a renumbered partition) stay a few runs long.
+    """
+
+    __slots__ = ("runs",)
+
+    def __init__(self, runs: Sequence[Tuple[int, int]] = ()) -> None:
+        merged: list = []
+        for a, b in sorted((int(a), int(b)) for a, b in runs if b > a):
+            if merged and a <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+            else:
+                merged.append((a, b))
+        self.runs = tuple(merged)
+
+    @staticmethod
+    def from_ids(ids) -> "IndexSet":
+        ids = sorted(set(int(i) for i in ids))
+        runs, start, prev = [], None, None
+        for i in ids:
+            if start is None:
+                start = prev = i
+            elif i == prev + 1:
+                prev = i
+            else:
+                runs.append((start, prev + 1))
+                start = prev = i
+        if start is not None:
+            runs.append((start, prev + 1))
+        return IndexSet(runs)
+
+    @staticmethod
+    def from_boxes(boxes, axis: int = 0) -> "IndexSet":
+        return IndexSet([(b.offset[axis], b.stop[axis]) for b in boxes])
+
+    def ids(self) -> List[int]:
+        return [i for a, b in self.runs for i in range(a, b)]
+
+    def __iter__(self):
+        return iter(self.ids())
+
+    def __len__(self) -> int:
+        return sum(b - a for a, b in self.runs)
+
+    def __bool__(self) -> bool:
+        return bool(self.runs)
+
+    def __contains__(self, i: int) -> bool:
+        return any(a <= i < b for a, b in self.runs)
+
+    def union(self, o: "IndexSet") -> "IndexSet":
+        return IndexSet(self.runs + o.runs)
+
+    def intersect(self, o: "IndexSet") -> "IndexSet":
+        out, i, j = [], 0, 0
+        while i < len(self.runs) and j < len(o.runs):
+            (a, b), (c, d) = self.runs[i], o.runs[j]
+            lo, hi = max(a, c), min(b, d)
+            if lo < hi:
+                out.append((lo, hi))
+            if b < d:
+                i += 1
+            else:
+                j += 1
+        return IndexSet(out)
+
+    def difference(self, o: "IndexSet") -> "IndexSet":
+        out = []
+        for a, b in self.runs:
+            cur = a
+            for c, d in o.runs:
+                if d <= cur or c >= b:
+                    continue
+                if c > cur:
+                    out.append((cur, c))
+                cur = max(cur, d)
+            if cur < b:
+                out.append((cur, b))
+        return IndexSet(out)
+
+    __or__, __and__, __sub__ = union, intersect, difference
+
+    def boxes(self) -> List[Box]:
+        return [Box((a,), (b - a,)) for a, b in self.runs]
+
+    def __eq__(self, o: object) -> bool:
+        return isinstance(o, IndexSet) and self.runs == o.runs
+
+    def __hash__(self) -> int:
+        return hash(self.runs)
+
+    def __repr__(self) -> str:
+        return "IndexSet{" + ", ".join(f"{a}" if b == a + 1 else f"{a}:{b}" for a, b in self.runs) + "}"

@@ -62,7 +62,11 @@ with air.herd(air_backend.herd_space(view), shape=(2,)) as h:
 | | Rank splitting `refine(view, axis, k)` → `owner(tx, ty)` | ✅ | ✅ | ✅ |
 | | Coefficients invertible mod P (modular inverse); pieces not dividing evenly over PEs (uniform trips + per-trip guard) | ✅ | ✅ | ✅ |
 | | Coefficients with gcd(a, P) > 1; owner maps with halo or uneven tiles | ✅ | ✅ | ❌ refused with a reason (guarded scan / lookup table; combine piece loop + size classes) |
-| 3. Irregular | Owner arrays, graph partitions, ghost sets, import/export, inspector–executor | ❌ | ❌ | ❌ |
+| 3. Irregular | Owner arrays (`owner_array` → runs + `TableMap`) | ✅ | ✅ | ✅ when renumbered contiguous (becomes an uneven block); scattered tables ❌ not yet |
+| | Sparse access pattern (`CSRPattern`; graphs as adjacency) | ✅ | ✅ graph view, cut edges | — |
+| | Inspector: owned / ghost sets, import & export lists, local CSR (`inspect`) | ✅ | ✅ ghost counts, import arcs | ❌ not yet (ghost gathers from L2) |
+| | Partitioners: block, random, BFS graph growing; `renumber` | ✅ | ✅ | — |
+| | Executor (ghost exchange + local SpMV), runtime-changing patterns | ❌ | ❌ | ❌ |
 | Transitions | `redistribute`, `plan_redistribution` | ❌ | ❌ | ❌ |
 | Native MLIR | `#dist.layout` attribute, `dist.bind` op | text only (`to_attr`) | | |
 
@@ -137,6 +141,38 @@ with air.herd(air_backend.herd_space(view)) as h:
 
 For block-cyclic 256/16 over 4 PEs this emits `scf.for` with `affine_map<()[s0, s1] -> ((s0 mod 4) * 16 + s1 * 64)>`. `air_backend.copy_kernel(view)` builds a complete L3 → L2 → layout → L2 → L3 kernel for any emittable layout; running it must return its input.
 
+## Irregular partitions (category 3)
+
+The usual decomposition, as in PETSc, Tpetra, Zoltan and PARTI/CHAOS, keeps three things apart:
+- the **partition**: an owner array over an index space;
+- the **sparsity**: a CSR pattern, where a graph is its adjacency matrix;
+- the **communication**: derived from the two by an inspector.
+
+```python
+from distlayout import bind, owner_array, grid_graph, bfs_partition, inspect, renumber
+
+pattern = grid_graph(8, 8, perm)            # 5-point stencil on a mesh (perm: a scrambled numbering)
+owner = bfs_partition(pattern, 4)           # or METIS / Scotch / your own owner[i]
+rows = bind(y, *owner_array(owner))         # pieces = runs of equal owner, TableMap: run -> PE
+sched = inspect(rows, pattern)              # x laid out like the rows (or pass x=)
+sched[(2,)].ghosts, sched[(2,)].imports     # IndexSet{...}, {src PE: IndexSet{...}}
+sched[(2,)].local_csr(pattern)              # columns renumbered: owned first, then ghosts
+perm2, owner2 = renumber(owner)             # contiguous ids per PE: the table becomes a placement
+```
+
+Behaviour:
+- `owner_array` reuses the existing pieces: an `UnevenBlock` of runs plus a `TableMap`. So views, `plan`, local numbering and `validate` all work unchanged.
+- Ghost owners are found per run, not per id.
+
+On a scrambled 8×8 mesh over 4 PEs:
+
+| Partition | Cut edges | Ghost volume |
+|---|---|---|
+| Blocks of ids | 166 | 123 |
+| BFS graph growing | 56 | 41 |
+
+With rows and x partitioned alike, each PE stores 16 owned + 8 to 12 ghost x entries instead of all 64. That's de-replication.
+
 ## Visualize
 
 ```bash
@@ -145,7 +181,7 @@ python3 examples/gallery.py          # writes docs/explorer.html, open it in a b
 
 `docs/explorer.html` is one self-contained page with no network or dependencies:
 
-- **Presets:** Block, Block + replicate, Uneven, Replicate, 2-D block, Transposed mapping, 2-D halo, Cyclic, Block-cyclic, Skew, Tile split, Rank split k=1 / k=4, Refine 1-D, eltwise_add.
+- **Presets:** Block, Block + replicate, Uneven, Replicate, 2-D block, Transposed mapping, 2-D halo, Cyclic, Block-cyclic, Skew, Tile split, Rank split k=1 / k=4, Refine 1-D, Irregular: block of ids / BFS partition / renumbered (with a ④ graph view of the mesh), eltwise_add.
 - **Builder,** in the library's two steps: *① Cut*, per tensor axis whole / block / uneven and a piece count; *③ Map*, per grid axis an owner expression such as `t0`, `t0 mod 4` or `(t0 + t1) mod 4` (blank = replicated). Halo radius, bytes per element and PE memory are also editable, and errors are explained inline.
 - **Picture, in three steps:** ① *Decompose*: a neutral cutter, the tensor's outline with dashed cut lines and piece names (`P2`, `P(1,0)`), no PEs yet. ② *Cut the tensor*: the same dashed cuts over the elements, each piece in its own color; hover an element for its formula (`p0 = i0 // 8 … → piece P(1,0) → PE 1`). ③ *Map pieces to PEs*: each card says which piece it got (`PE 1 ← P(1,0)`), with a memory-fit bar against the PE budget and red arrows for halo imports. The *Transposed mapping* preset uses the same cuts as *2-D block* but a different mapping.
 - **Code tabs:** Python spec · `#dist.layout` · `air.api` herd body · MLIR (the real module, when rendered with MLIR-AIR installed).
