@@ -47,6 +47,37 @@ with air.herd(air_backend.herd_space(view), shape=(2,)) as h:
 - `examples/demo.py` prints the five design cases. It needs no AIR.
 - `examples/eltwise_add_with_l2_dist.py` is upstream's `eltwise_add_with_l2` with the layout supplying every L2↔L1 window.
 
+## How it compares
+
+This comparison is based on our reading of these projects, not on running them, so treat the entries for the other three as approximate.
+
+| Capability | **distlayout** | **LEGO** | **PartTensor** | **Spensor** |
+|---|---|---|---|---|
+| Main purpose | ownership: who holds what, across PEs | layout inside one memory (index → address) | distributed sparse tensors in MLIR | spatial tensor ops on AMD NPU |
+| Distribution across PEs | ✅ | ❌ | ✅ | ✅ |
+| Layout *inside* a PE (tiling, swizzle) | ❌ | ✅ | ❌ | ⚠️ partial |
+| Layout separate from the tensor | ✅ | ✅ | ⚠️ encoding on the tensor type | ❌ split is an op |
+| Binds to an existing buffer (`memref.alloc`) | ✅ | ❌ | ❌ | ❌ |
+| Block / uneven block | ✅ | ✅ (inside one memory) | ✅ rectangles | ⚠️ even splits only |
+| Replication (primary vs replica) | ✅ | ❌ | ❌ | ⚠️ broadcast, no owner semantics |
+| Cyclic / block-cyclic / skew (formula owners) | ✅ | ⚠️ as permutations, not ownership | ❌ | ❌ |
+| Irregular owner arrays / graph partitions | ✅ | ❌ | ❌ only rectangles | ❌ |
+| Sparse access → ghost / import lists (inspector) | ✅ | ❌ | ⚠️ slice movement | ❌ |
+| Halo / ghost regions | ✅ | ❌ | ❌ | ❌ |
+| Splitting below an MPI rank (`refine`) | ✅ | ❌ | ❌ | ❌ |
+| Generates AIR code | ✅ (`air.api`) | ❌ | ❌ (lowers to MPI) | ✅ |
+| Native MLIR dialect | ❌ text only | ✅ | ✅ | ✅ (xDSL) |
+| Runs on hardware today | ❌ not yet | ✅ | ✅ | ✅ |
+| Interactive visualizer | ✅ | ✅ | ❌ | ❌ |
+
+✅ = yes, ❌ = no, ⚠️ = partly.
+
+- **LEGO** decides *where an element sits inside one memory*; distlayout decides *which PE owns it*. They are complementary: LEGO could later supply the layout inside a PE.
+- **PartTensor** covers distributed sparse tensors split into rectangles, lowered to MPI. distlayout covers the rectangle case (`rectangle_fetch`) and adds formula owners, owner arrays and ghost schedules.
+- **Spensor** is the closest relative: spatial splits on AIR. It ties the split to its own tensor types and memory levels; distlayout keeps the layout separate, binds to existing buffers, and covers more layout kinds.
+
+Where distlayout is behind: no native MLIR dialect yet, and nothing has run on hardware.
+
 ## Coverage
 
 | Category | Feature | Core (Python) | Explorer | AIR backend |
