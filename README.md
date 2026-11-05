@@ -50,21 +50,19 @@ with air.herd(air_backend.herd_space(view), shape=(2,)) as h:
 ## Visualize
 
 ```bash
-python3 examples/gallery.py          # writes docs/gallery/*.html, open docs/gallery/index.html
+python3 examples/gallery.py          # writes docs/explorer.html, open it in a browser
 ```
 
-`distlayout.viz.render_html(view, requests={pe: Box}, mlir=text)` turns any view into one self-contained HTML page. It needs no network or dependencies, and the panels are linked: hover an element to light up every PE holding it, or a PE to light up its region.
+`docs/explorer.html` is one self-contained page with no network or dependencies:
 
-| Panel | Shows |
-|---|---|
-| 01 Input | the logical tensor, each element colored by its primary owner |
-| 02 Mapping | the PE grid: each PE's region, with primary vs replica (striped) |
-| 03 Local views | each PE's local buffer; with `requests=`, owned cells vs `g` ghost cells and where each ghost comes from |
-| 04 Layout | the Python spec (`spec_code`) and the `#dist.layout` text |
-| 05 Generated code | the `air.api` herd body with the derived affine window, plus a per-PE table of the region each reads |
-| 06 MLIR | the real module from `air.api`, when MLIR-AIR is installed |
+- **Presets:** Block, Block + replicate, Uneven, Replicate, 2-D block, 2-D halo, Rank split, eltwise_add.
+- **Builder:** tensor shape, PE grid, and for each tensor axis *whole* or *block/uneven → grid axis g*. Grid axes with nothing placed on them are replicated. Halo radius, bytes per element and PE memory are also editable, and errors are explained inline.
+- **Picture:** the tensor colored by owner; hover an element for its owner formula and holders. Below it, the PE grid with memory-fit bars against the PE budget and red arrows for halo imports.
+- **Code tabs:** Python spec · `#dist.layout` · `air.api` herd body · MLIR (the real module, when rendered with MLIR-AIR installed).
+- **Pin as A** to compare bytes/PE with the current layout. In *Rank split*, pin at 8 × 1, then set the grid to 8 × 4.
+- **Export SVG** of the picture.
 
-Gallery cases: block, block + replication, uneven, full replication, 2-D block, 2-D halo, 1-D halo plan, and upstream `eltwise_add_with_l2`.
+For your own views, use `distlayout.viz.render_html(view, halo=1, mlir=text)` or `render_explorer([(name, view, opts), ...])`. The page runs a JavaScript port of the v0 layout rules so the builder updates live. `tests/test_viz.py` checks in a headless browser that it agrees with the Python library on every preset.
 
 ## Tests
 

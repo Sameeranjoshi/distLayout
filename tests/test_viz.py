@@ -1,8 +1,25 @@
+"""The explorer page.
+
+The page re-implements the v0 layout rules in JavaScript so its builder can
+update live. ``test_page_agrees_with_python`` loads the page in a headless
+browser (Playwright, if available) and checks, for every gallery preset, that
+the page computes the same owners, PE regions, halo plans and layout text as
+the Python library.
+"""
+
+import importlib.util
 import json
 import re
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
 
 from distlayout import Block, Box, Decomposition, Grid, Map, Replicate, UnevenBlock, bind
-from distlayout.viz import air_code, render_html, render_index, spec_code
+from distlayout.viz import air_code, render_explorer, render_html, spec_code, to_spec
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class Buf:
@@ -10,37 +27,15 @@ class Buf:
         self.shape = shape
 
 
-def model_of(page):
-    return json.loads(re.search(r"const M=(\{.*?\});\n", page, re.S).group(1).replace("<\\/", "</"))
-
-
-def test_block_replicate_page_model():
-    v = bind(Buf(100), Decomposition(Block(0, 4)), Map(Grid((4, 4)), {0: 0}, replicate=[1]))
-    page = render_html(v, title="t")
-    m = model_of(page)
-    assert len(m["parts"]) == 4 and m["parts"][2]["holders"] == [8, 9, 10, 11]
-    assert [p["color"] for p in m["parts"]] == ["#3978CF", "#E59B38", "#249A82", "#A36BC6"]
-    assert sum(not pe["primary"] for pe in m["pes"]) == 12
-    assert "l2[tx*25 : tx*25 + 25]" in page            # the derived affine window
-    assert "<!doctype html>" in page and "http" not in page.split("<body>")[0]
-
-
-def test_halo_local_view_marks_ghosts():
-    v = bind(Buf(48), Decomposition(Block(0, 4)), Map(Grid(4), {0: 0}))
-    m = model_of(render_html(v, requests={1: Box((11,), (14,))}))
-    pieces = m["local"][1]["pieces"]
-    assert [(p["local"], p["src"]) for p in pieces] == [(False, 0), (True, 1), (False, 2)]
-
-
-def test_uneven_page_explains_refusal():
-    v = bind(Buf(99), Decomposition(UnevenBlock(0, parts=4)), Map(Grid(4), {0: 0}))
-    code, table = air_code(v)
-    assert "uneven" in code and table == []
-    assert "uneven" in render_html(v)
+def presets():
+    spec = importlib.util.spec_from_file_location("gallery", ROOT / "examples" / "gallery.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod.eltwise_mlir = lambda n, tile: None          # no MLIR-AIR needed here
+    return mod.presets()
 
 
 def test_spec_code_round_trips():
-    from distlayout import DataSource  # noqa: F401  (names used by the generated code)
     for v in [bind(Buf(16, 32), Decomposition(Block(0, 2), Block(1, 2)), Map(Grid((2, 2)), {0: 0, 1: 1})),
               bind(Buf(100), Decomposition(), Replicate(Grid((4, 4)))),
               bind(Buf(99), Decomposition(UnevenBlock(0, parts=4)), Map(Grid((4, 1)), {0: 0}, replicate=[1]))]:
@@ -49,5 +44,96 @@ def test_spec_code_round_trips():
         assert env["view"].to_attr() == v.to_attr()
 
 
-def test_index_page():
-    assert "block.html" in render_index([("block.html", "Block", "d")])
+def test_air_code():
+    v = bind(Buf(100), Decomposition(Block(0, 4)), Map(Grid((4, 4)), {0: 0}, replicate=[1]))
+    code, table = air_code(v)
+    assert "l2[tx*25 : tx*25 + 25]" in code and len(table) == 16
+    uneven = bind(Buf(99), Decomposition(UnevenBlock(0, parts=4)), Map(Grid(4), {0: 0}))
+    assert air_code(uneven)[1] == [] and "uneven" in air_code(uneven)[0]
+
+
+def test_page_is_self_contained():
+    v = bind(Buf(100), Decomposition(Block(0, 4)), Map(Grid(4), {0: 0}))
+    page = render_html(v, title="Block", mlir="module {}")
+    assert page.startswith("<!doctype html>")
+    assert not re.search(r"<(script|link)[^>]+(src|href)=", page)     # nothing loaded from outside
+    presets_json = json.loads(re.search(r"const PRESETS=(\[.*?\]), COLORS", page, re.S).group(1))
+    assert presets_json[0]["mlir"] == "module {}" and presets_json[0]["axes"] == [{"kind": "block", "g": 0}]
+
+
+def test_to_spec_rejects_what_it_cannot_draw():
+    with pytest.raises(NotImplementedError):
+        to_spec(bind(Buf(2, 2, 2), Decomposition(Block(0, 2)), Map(Grid(2), {0: 0})))
+
+
+# -- the JavaScript port against Python ----------------------------------------
+
+def _python_facts(view, halo):
+    owners = [_pe_ix(view, view.primary_owner(i)) for i in Box.full(view.shape).indices()]
+    held = [_box(view.held_region(pe)) for pe in view.grid.coords()]
+    plans = []
+    for pe in view.grid.coords():
+        r = view.held_region(pe)
+        req = Box.from_bounds([max(0, o - halo) for o in r.offset], [min(n, s + halo) for s, n in zip(r.stop, view.shape)])
+        plans.append(sorted([_box(t.region), t.local, None if t.local else _pe_ix(view, t.src_pe)]
+                            for t in view.plan(pe, req).transfers))
+    return {"owners": owners, "held": held, "plans": plans, "attr": view.to_attr(),
+            "py": spec_code(view, src="SRC")}
+
+
+def _pe_ix(view, pe):
+    ix = 0
+    for c, s in zip(pe, view.grid.shape):
+        ix = ix * s + c
+    return ix
+
+
+def _box(b):
+    return [list(b.offset), list(b.stop)]
+
+
+JS = r"""
+const { chromium } = require('playwright');
+(async () => {
+  const b = await chromium.launch(); const p = await b.newPage();
+  await p.goto('file://' + process.argv[2]);
+  const out = await p.evaluate(() => PRESETS.map(spec => {
+    const D = window.distlayout, L = D.build(spec);
+    const all = (shape) => shape.reduce((acc, n) => acc.flatMap(a => [...Array(n).keys()].map(x => a.concat([x]))), [[]]);
+    return {
+      owners: all(L.shape).map(i => L.peIx(L.primaryOf(L.partOf(i)))),
+      held: L.pes.map(pe => { const r = L.region(L.partAt(pe)); return [r.lo, r.hi]; }),
+      plans: L.pes.map(pe => D.plan(L, pe, +spec.halo || 0).pieces
+        .map(x => [[x.r.lo, x.r.hi], x.local, x.local ? null : x.src])),
+      attr: D.attrText(L), py: D.pyText(Object.assign({}, L, { spec: Object.assign({}, spec, { src: 'SRC' }) })),
+    };
+  }));
+  console.log(JSON.stringify(out)); await b.close();
+})();
+"""
+
+
+def _have_playwright():
+    if not shutil.which("node"):
+        return False
+    r = subprocess.run(["node", "-e", "require('playwright')"], capture_output=True)
+    return r.returncode == 0
+
+
+@pytest.mark.skipif(not _have_playwright(), reason="needs node + playwright")
+def test_page_agrees_with_python(tmp_path):
+    entries = presets()
+    page = tmp_path / "explorer.html"
+    page.write_text(render_explorer([(n, v, {k: x for k, x in kw.items() if x is not None}) for n, v, kw in entries]))
+    script = tmp_path / "check.js"
+    script.write_text(JS)
+    res = subprocess.run(["node", str(script), str(page)], capture_output=True, text=True, timeout=120)
+    assert res.returncode == 0, res.stderr
+    js = json.loads(res.stdout)
+    assert len(js) == len(entries)
+    for (name, view, kw), got in zip(entries, js):
+        want = _python_facts(view, kw.get("halo", 0))
+        got["plans"] = [sorted(pl) for pl in got["plans"]]
+        for key in ("owners", "held", "attr", "py"):
+            assert got[key] == want[key], f"{name}: {key} differs"
+        assert got["plans"] == want["plans"], f"{name}: halo plans differ"
