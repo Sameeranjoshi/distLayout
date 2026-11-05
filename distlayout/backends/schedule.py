@@ -17,12 +17,14 @@ owner expression on ``g``                  solved as
 ``t_k``                                     ``t_k = x_g``
 ``t_k floordiv q`` and ``t_k mod q``        ``t_k = x_g1 * q + x_g2``  (refine)
 ``t_k floordiv q`` alone                    ``t_k = x_g * q + s``,  ``s < q``
-``(a·t + c) mod P``, a unit coefficient     ``t_j = (±(x_g - c - Σ a_k t_k)) mod P + P*s``
-on some ``t_j``                             (``n_j`` divisible by ``P``)
+``(a·t + c) mod P``, some ``t_j`` with      ``t_j = (a_j^-1 (x_g - c - Σ a_k t_k)) mod P + P*s``
+``gcd(a_j, P) = 1``                         (``s < ceil(n_j / P)``, guarded when ``P ∤ n_j``)
 =========================================  =========================================
 
-Piece coordinates no constraint fixes become full loops. Anything else raises
-``NotImplementedError``. Every schedule is checked by enumeration against the
+Piece coordinates no constraint fixes become full loops. When pieces do not
+divide evenly over PEs, every PE still runs the same number of trips (AIR's
+rule) and the surplus trips are skipped by a per-trip guard ``t_k < n_k``.
+Anything else raises ``NotImplementedError``. Every schedule is checked by enumeration against the
 view before it is returned, so a wrong inversion can never be emitted.
 
 The tile stack's slot order is the loop nest's row-major order. For cyclic,
@@ -34,6 +36,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import product
+from math import gcd
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from ..expr import Add, Const, Expr, FloorDiv, Mod, Mul, Var
@@ -67,6 +70,7 @@ class Schedule:
     loops: List[int]
     recipes: Dict[int, Tuple]          # piece coordinate k -> recipe
     ncomp: int
+    guards: Tuple[Tuple[int, int], ...] = ()   # (k, n_k): skip trips where t_k >= n_k (uneven piece counts)
 
     @property
     def slots(self) -> int:
@@ -94,12 +98,12 @@ class Schedule:
                 v = x[g] * q + s[i]
             elif kind == "loop":
                 v = s[r[1]]
-            elif kind == "pivot":                    # t_j = (sign*(x_g - c - Σ a_k t_k)) mod P + P*s
-                _, g, coeffs, c, sign, P, i = r
+            elif kind == "pivot":                    # t_j = (m*(x_g - c - Σ a_k t_k)) mod P + P*s, m = a_j^-1 mod P
+                _, g, coeffs, c, m, P, i = r
                 acc = x[g] - c if c else x[g]
                 for kk, a in coeffs.items():
                     acc = acc - t(kk) * a
-                v = ((acc if sign == 1 else acc * -1) % P) + s[i] * P
+                v = ((acc if m == 1 else acc * m) % P) + s[i] * P
             else:  # pragma: no cover
                 raise AssertionError(r)
             memo[k] = v
@@ -114,11 +118,14 @@ class Schedule:
             v = si if v is None else v * e + si
         return 0 if v is None else v
 
-    def concrete(self, pe: Sequence[int]) -> List[Tuple[int, Tuple[int, ...]]]:
-        """``[(slot, piece), ...]`` at PE ``pe``, in slot order."""
+    def concrete(self, pe: Sequence[int], guarded: bool = True) -> List[Tuple[int, Tuple[int, ...]]]:
+        """``[(slot, piece), ...]`` at PE ``pe``, in slot order (trips the guards skip are left out)."""
         out = []
         for s in product(*(range(e) for e in self.loops)):
-            out.append((self.slot(s) if self.loops else 0, self.pieces(pe, s)))
+            pid = self.pieces(pe, s)
+            if guarded and any(pid[k] >= n for k, n in self.guards):
+                continue
+            out.append((self.slot(s) if self.loops else 0, pid))
         return out
 
 
@@ -165,15 +172,16 @@ def solve(view) -> Schedule:
             raise NotImplementedError(f"cannot invert g{g} = {e} (supported: t, t floordiv q, (linear) mod P)")
         coeffs, c = lin
         P = e.k
-        cand = [k for k, a in coeffs.items() if a in (1, -1) and k not in recipes]
-        if not cand:
-            raise NotImplementedError(f"cannot invert g{g} = {e}: no free coordinate with coefficient ±1")
-        j = max(cand)                                   # the last free coordinate: keeps row-major order
-        if num[j] % P:
+        unit = [k for k, a in coeffs.items() if a in (1, -1) and k not in recipes]
+        inv = [k for k, a in coeffs.items() if k not in recipes and gcd(a % P, P) == 1]
+        if not (unit or inv):
             raise NotImplementedError(
-                f"g{g} = {e}: t{j} has {num[j]} values, not a multiple of {P}, so PEs would hold "
-                f"different numbers of pieces (air.api needs the same trip count on every core)")
-        pending.append((g, j, {k: a for k, a in coeffs.items() if k != j}, c, coeffs[j], P))
+                f"cannot invert g{g} = {e}: no free coordinate whose coefficient is invertible mod {P} "
+                f"(gcd > 1 leaves some PEs without pieces; that needs a guarded scan or a lookup table)")
+        j = max(unit) if unit else max(inv)             # prefer ±1; the last free coordinate keeps row-major order
+        a = coeffs[j]
+        m = a if a in (1, -1) else pow(a % P, -1, P)
+        pending.append((g, j, {k: v for k, v in coeffs.items() if k != j}, c, m, P))
         recipes[j] = ("pivot-pending",)
         used.add(g)
     # loops: one per coordinate that is free or a pivot, in coordinate order
@@ -187,10 +195,16 @@ def solve(view) -> Schedule:
             loop_of[k] = new_loop(r[2])
             recipes[k] = ("group", r[1], r[2], loop_of[k])
         elif r[0] == "pivot-pending":
-            g, j, rest, c, a, P = next(p for p in pending if p[1] == k)
-            loop_of[k] = new_loop(num[k] // P)
-            recipes[k] = ("pivot", g, rest, c, a, P, loop_of[k])
+            g, j, rest, c, m, P = next(p for p in pending if p[1] == k)
+            loop_of[k] = new_loop(-(-num[k] // P))      # ceil: the PEs with fewer pieces skip the last trip
+            recipes[k] = ("pivot", g, rest, c, m, P, loop_of[k])
     sched = Schedule(loops, recipes, ncomp)
+    # a coordinate that can run past its extent on some PE gets a per-trip guard t_k < n_k
+    over = set()
+    for pe in view.grid.coords():
+        for _, pid in sched.concrete(pe, guarded=False):
+            over |= {k for k in range(ncomp) if pid[k] >= num[k]}
+    sched.guards = tuple((k, num[k]) for k in sorted(over))
     _verify(view, sched)
     return sched
 
@@ -206,8 +220,11 @@ def _verify(view, sched: Schedule) -> None:
             raise NotImplementedError(
                 f"owner map {view.mapping!r} could not be inverted exactly at PE {pe} "
                 f"(schedule gives {sorted(pids)[:6]}, layout has {want[:6]})")
-        if sorted(s for s, _ in got) != list(range(sched.slots)):
-            raise AssertionError("slots are not a bijection")
+        slots = [s for s, _ in got]
+        if len(set(slots)) != len(slots) or not all(0 <= s < sched.slots for s in slots):
+            raise AssertionError("slots are not distinct")
+        if not sched.guards and len(slots) != sched.slots:
+            raise AssertionError("unguarded schedule leaves slots empty")
 
 
 def is_placement(view) -> bool:

@@ -110,6 +110,9 @@ OWNER_MAP_CASES = {
                                 OwnerMap(Grid(4), {0: "(t0 + 2*t1) mod 4"})), "mod 4", 1),
     "refine": (lambda: refine(bind(_Shape(1024), Decomposition(Block(0, 4)), Map(Grid(4), {0: 0})), axis=0, k=2),
                "* 256", None),
+    "inverse": (lambda: bind(_Shape(64), Decomposition(Block(0, 64)), OwnerMap(Grid(4), {0: "(t0 * 3) mod 4"})),
+                "((s0 * 3) mod 4 + s1 * 4)", 1),
+    "cyclic_tail": (lambda: bind(_Shape(10), *cyclic(10, 4)), "scf.if", 1),     # 3 trips, 3rd guarded
 }
 
 

@@ -60,7 +60,8 @@ with air.herd(air_backend.herd_space(view), shape=(2,)) as h:
 | | Cyclic, block-cyclic, skew, tile split | ✅ | ✅ | ✅ `air.sequential` loops over each PE's pieces; built with real `air.api` |
 | | Several pieces per PE (local `(slot, *tile)`) | ✅ | ✅ | ✅ `for_each_piece`, `load_local` / `store_local` |
 | | Rank splitting `refine(view, axis, k)` → `owner(tx, ty)` | ✅ | ✅ | ✅ |
-| | Owner maps with no unit coefficient, or pieces not dividing evenly over PEs | ✅ | ✅ | ❌ refused with a reason (would need lookup tables or guards) |
+| | Coefficients invertible mod P (modular inverse); pieces not dividing evenly over PEs (uniform trips + per-trip guard) | ✅ | ✅ | ✅ |
+| | Coefficients with gcd(a, P) > 1; owner maps with halo or uneven tiles | ✅ | ✅ | ❌ refused with a reason (guarded scan / lookup table; combine piece loop + size classes) |
 | 3. Irregular | Owner arrays, graph partitions, ghost sets, import/export, inspector–executor | ❌ | ❌ | ❌ |
 | Transitions | `redistribute`, `plan_redistribution` | ❌ | ❌ | ❌ |
 | Native MLIR | `#dist.layout` attribute, `dist.bind` op | text only (`to_attr`) | | |
@@ -118,7 +119,9 @@ Halo cells are read from the shared L2 buffer, the segment-wide view of the tens
 The herd body runs *on* a PE, so the backend inverts the owner map: "I am PE `tx`; my s-th piece is `t(tx, s)`". `distlayout.backends.schedule.solve` does this in closed form for:
 - bare coordinates;
 - `floordiv`/`mod` pairs (refine);
-- `(linear) mod P` with a ±1 coefficient.
+- `(linear) mod P` where some coefficient is invertible mod P (modular inverse).
+
+When pieces don't divide evenly over PEs, every PE runs the same number of trips, which AIR requires, and the surplus trip is skipped by `air.ops.branch(t < n)`.
 
 Each schedule is checked by enumeration against the layout before anything is emitted.
 

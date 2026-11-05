@@ -29,6 +29,18 @@ class Recorder:
 
         class ops:
             @staticmethod
+            def branch(cond):
+                rec.calls.append(("if", cond))
+
+                class B:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *a):
+                        return False
+                return B()
+
+            @staticmethod
             def load(dst, src):
                 rec.calls.append(("load", dst, src))
 
@@ -123,7 +135,6 @@ def test_load_local_fills_the_stack():
 
 
 @pytest.mark.parametrize("make,msg", [
-    (lambda: bind(Buf(10), *cyclic(10, 4)), "not a multiple"),                                    # 10 pieces on 4 PEs
     (lambda: bind(Buf(8), Decomposition(Block(0, 8)), OwnerMap(Grid(4), {0: "(t0 * 2) mod 4"})), "coefficient"),
     (lambda: bind(Buf(8, 8), Decomposition(Block(0, 2), Block(1, 2)),
                   OwnerMap(Grid((2, 2)), {0: "t0", 1: "t0"})), "two grid axes"),
@@ -131,3 +142,43 @@ def test_load_local_fills_the_stack():
 def test_refuses_what_it_cannot_invert(make, msg):
     with pytest.raises(NotImplementedError, match=msg):
         solve(make())
+
+
+# -- closing the gaps: modular inverse, uneven piece counts ------------------------
+
+def test_invertible_coefficient_uses_the_modular_inverse():
+    # 3 * t0 mod 4: 3 is its own inverse mod 4, so t0 = (3 * tx) mod 4 + 4 s
+    v = bind(Buf(16), Decomposition(Block(0, 16)), OwnerMap(Grid(4), {0: "(t0 * 3) mod 4"}))
+    sch = solve(v)
+    assert sch.loops == [4] and not sch.guards
+    for pe in v.grid.coords():
+        assert sorted(p for _, p in sch.concrete(pe)) == sorted(v.pieces_at(pe))
+    _, calls = emitted(v)
+    assert calls == [("s0", ["(tx*3) % 4 + s0*4 : (tx*3) % 4 + s0*4 + 1"])]
+
+
+def test_uneven_piece_counts_get_a_guarded_tail():
+    # cyclic 10 over 4: PEs 0, 1 hold 3 pieces, PEs 2, 3 hold 2 -- every PE runs 3 trips, the 3rd is guarded
+    v = bind(Buf(10), *cyclic(10, 4))
+    sch = solve(v)
+    assert sch.loops == [3] and sch.guards == ((0, 10),)
+    assert [len(sch.concrete((p,))) for p in range(4)] == [3, 3, 2, 2]
+    for pe in v.grid.coords():
+        assert [p for _, p in sch.concrete(pe)] == list(v.pieces_at(pe))
+    loops, calls = emitted(v)
+    assert loops == [("s0", 3)]
+    assert calls[0] == ("if", "tx % 4 + s0*4 < 10") and calls[1][1] == ["tx % 4 + s0*4 : tx % 4 + s0*4 + 1"]
+
+
+def test_block_cyclic_tail_and_group_tail():
+    v = bind(Buf(20), *block_cyclic(20, 2, 4))          # 10 blocks over 4 PEs
+    assert solve(v).guards == ((0, 10),)
+    g = bind(Buf(10), Decomposition(Block(0, 10)), OwnerMap(Grid(4), {0: "t0 floordiv 3"}))   # groups of 3, last short
+    sch = solve(g)
+    assert sch.loops == [3] and sch.guards == ((0, 10),) and [len(sch.concrete((p,))) for p in range(4)] == [3, 3, 3, 1]
+
+
+def test_gcd_greater_than_one_is_still_refused():
+    v = bind(Buf(8), Decomposition(Block(0, 8)), OwnerMap(Grid(4), {0: "(t0 * 2) mod 4"}))
+    with pytest.raises(NotImplementedError, match="invertible"):
+        solve(v)

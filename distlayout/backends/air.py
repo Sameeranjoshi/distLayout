@@ -177,7 +177,24 @@ def for_each_piece(view: DistributedView, coords: Sequence[Any], body: Callable[
         body(0, slice_key(view, coords))
         return
     sched = schedule(view)
-    _loop_nest(air, sched.loops, lambda s: body(sched.slot(s), _piece_key(view, sched.pieces(coords, s))))
+
+    def trip(s):
+        pid = sched.pieces(coords, s)
+        guards = list(sched.guards)
+
+        def guarded(i):
+            if i == len(guards):
+                body(sched.slot(s), _piece_key(view, pid))
+                return
+            k, n = guards[i]
+            if isinstance(pid[k], int):                 # concrete: decide in Python
+                if pid[k] < n:
+                    guarded(i + 1)
+                return
+            with air.ops.branch(pid[k] < n):            # this trip only on PEs that have the piece
+                guarded(i + 1)
+        guarded(0)
+    _loop_nest(air, sched.loops, trip)
 
 
 # -- size classes: uneven layouts and halos (placement maps) ---------------------
