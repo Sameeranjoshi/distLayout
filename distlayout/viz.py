@@ -107,12 +107,11 @@ def air_code(view: DistributedView, src: str = "l2", dtype: str = "f32") -> Tupl
     from .backends import air as backend
 
     names = ["tx", "ty", "tz"][: view.grid.rank]
-    if as_placement(view.mapping, view.decomposition.num_parts(view.shape)) is None:
-        return ("# owner map: PEs can hold several pieces; the AIR backend emits\n"
-                "# placement maps only (AIR work is on hold).", [])
     if not view.is_uniform():
         return ("# uneven layout: PEs hold different sizes, and air.api needs one static\n"
                 "# transfer size, so the AIR backend does not emit this layout yet.", [])
+    if as_placement(view.mapping, view.decomposition.num_parts(view.shape)) is None:
+        return _owner_map_code(view, names, src, dtype), []
     key = backend.slice_key(view, [_Sym.of(n) for n in names])
     sub = ", ".join(f"{k.start} : {k.stop}" for k in key)
     herd = ", ".join(f"range({r.start}, {r.stop}, {r.step})" if r.step != 1 else f"range({r.stop})"
@@ -123,6 +122,42 @@ def air_code(view: DistributedView, src: str = "l2", dtype: str = "f32") -> Tupl
             f"    a = air.alloc({list(view.max_local_shape())}, {dtype}, scope=h.private())\n"
             f"    air.ops.load(a, {src}[{sub}])")
     return code, [(pe, backend.slice_key(view, pe)) for pe in view.grid.coords()]
+
+
+def _owner_map_code(view: DistributedView, names: List[str], src: str, dtype: str) -> str:
+    """The herd body for an owner map: a loop over this PE's pieces, offsets from the inverted map."""
+    from .backends import air as backend
+    from .backends.schedule import Text
+    try:
+        sched = backend.schedule(view)
+    except NotImplementedError as e:
+        return f"# not emitted: {e}"
+    tile = list(view.partition_region(next(view.partitions())).size)
+    loop_names: List[str] = []
+
+    class Seq:
+        @staticmethod
+        def sequential(lo, hi):
+            loop_names.append((f"s{len(loop_names)}", hi))
+            yield Text.var(loop_names[-1][0])
+
+    keys: List[str] = []
+    backend.for_each_piece(view, [Text.var(n) for n in names],
+                           lambda slot, key: keys.append(", ".join(f"{k.start} : {k.stop}" for k in key)), air=Seq)
+    ind = "    "
+    lines = [f"with air.herd([{', '.join(f'range({n})' for n in view.grid.shape)}]) as h:", "  @h.body",
+             f"  def _({', '.join(names)}):",
+             f"    a = air.alloc({tile}, {dtype}, scope=h.private())   # one tile, reused for each piece"]
+    for nm, hi in loop_names:
+        lines.append(f"{ind}for {nm} in air.sequential(0, {hi}):")
+        ind += "  "
+    lines.append(f"{ind}air.ops.load(a, {src}[{keys[0]}])")
+    lines.append(f"{ind}...                                  # compute on piece a")
+    pieces = len(view.pieces_at(next(view.grid.coords())))
+    lines += ["", f"# {pieces} pieces per PE; owner map inverted by distlayout.backends.schedule:",
+              f"#   {', '.join(f'g{g} = {e}' for g, e in sorted(view.mapping.exprs().items()))}",
+              "# with distlayout: air_backend.for_each_piece(view, coords, body)"]
+    return "\n".join(lines)
 
 
 # -- view -> page spec -------------------------------------------------------------
@@ -167,6 +202,8 @@ def to_spec(view: DistributedView, title: str = "", note: str = "", halo: int = 
             "cuts": cuts, "map": mapping, "halo": halo, "bytes": elem_bytes, "kib": pe_kib, "src": src}
     if mlir:
         spec["mlir"] = mlir
+    if as_placement(view.mapping, view.decomposition.num_parts(view.shape)) is None:
+        spec["air"] = air_code(view, src)[0]
     return spec
 
 
@@ -217,7 +254,7 @@ input.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
 .tabs button{font:inherit;font-size:12.5px;border:0;background:none;color:var(--muted);padding:6px 10px;cursor:pointer;border-bottom:2px solid transparent}
 .tabs button.on{color:var(--ink);border-bottom-color:var(--accent)}
 pre{background:var(--code);border:1px solid var(--line);border-top:0;border-radius:0 0 8px 8px;margin:0;padding:10px 12px;
-font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word;max-height:340px;overflow:auto}
+font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre;max-height:360px;overflow:auto}
 .note{color:var(--muted);font-size:13px;margin:0 0 10px}
 .formula{font:12.5px ui-monospace,Menlo,Consolas,monospace;color:var(--muted);min-height:20px;margin:8px 0 0}
 .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:12px}
@@ -360,7 +397,7 @@ function attrText(L){
   if(L.placement){const pl=L.exprs.map((e,g)=>e?[e.k,g]:null).filter(Boolean).sort((a,b)=>a[0]-b[0]);return head+`place = [${pl.map(([k,g])=>`${k} -> g${g}`).join(", ")}], `+rep}
   return head+`owner = [${L.exprs.map((e,g)=>e?`g${g} = ${strE(e)}`:null).filter(Boolean).join(", ")}], `+rep}
 function airText(L){
-  if(!L.placement)return "# owner map: PEs can hold several pieces; the AIR backend emits\n# placement maps only (AIR work is on hold).";
+  if(!L.placement)return cur.air||"# owner map edited: the page does not invert owner maps itself.\n# The Python backend does: air_backend.for_each_piece(view, coords, body)\n# (python3 examples/gallery.py embeds the emitted loop nest for each preset).";
   if(!L.uniform)return "# uneven layout: PEs hold different sizes, and air.api needs one static\n# transfer size, so the AIR backend does not emit this layout yet.";
   const names=["tx","ty","tz"].slice(0,L.grid.length), src=L.spec.src||"l2", gOf=k=>L.exprs.findIndex(e=>e&&e.k===k);
   const sub=L.shape.map((n,a)=>{const k=L.rules.findIndex(r=>r.axis===a);if(k<0)return `0 : ${n}`;const b=L.rules[k].sizes[0],c=names[gOf(k)];return `${c}*${b} : ${c}*${b} + ${b}`}).join(", ");
@@ -484,11 +521,11 @@ function syncForm(){
   box.querySelectorAll("select").forEach(sel=>sel.onchange=()=>{const a=+sel.dataset.a,k=sel.value;cur.cuts=cur.cuts.filter(c=>c.axis!==a);
     if(k!=="whole"){const ncut=cur.cuts.length;cur.cuts.push({axis:a,kind:k,parts:cur.grid[Math.min(ncut,cur.grid.length-1)]||2,policy:"balanced"});cur.cuts.sort((x,y)=>x.axis-y.axis);
       const k2=cur.cuts.findIndex(c=>c.axis===a),g=Math.min(k2,cur.grid.length-1);if(!(cur.map[g]||"").trim())cur.map[g]="t"+k2}
-    delete cur.mlir;syncForm();render()});
-  box.querySelectorAll("input").forEach(inp=>inp.oninput=()=>{const c=cur.cuts.find(c=>c.axis===+inp.dataset.p);if(c){c.parts=+inp.value;delete c.sizes;delete cur.mlir;render()}});
+    delete cur.mlir;delete cur.air;syncForm();render()});
+  box.querySelectorAll("input").forEach(inp=>inp.oninput=()=>{const c=cur.cuts.find(c=>c.axis===+inp.dataset.p);if(c){c.parts=+inp.value;delete c.sizes;delete cur.mlir;delete cur.air;render()}});
   const mb=$("maps");mb.innerHTML="";
   cur.grid.forEach((n,g)=>mb.insertAdjacentHTML("beforeend",`<label>Grid axis g${g} (${n} PEs)</label><input class="mono" data-g="${g}" value="${(cur.map[g]||"").replace(/"/g,"&quot;")}" placeholder="replicated">`));
-  mb.querySelectorAll("input").forEach(inp=>inp.oninput=()=>{cur.map[+inp.dataset.g]=inp.value;delete cur.mlir;render()});
+  mb.querySelectorAll("input").forEach(inp=>inp.oninput=()=>{cur.map[+inp.dataset.g]=inp.value;delete cur.mlir;delete cur.air;render()});
 }
 function load(spec){cur=JSON.parse(JSON.stringify(spec));$("shape").value=cur.shape.join(" × ");$("grid").value=cur.grid.join(" × ");
   $("halo").value=cur.halo||0;$("bytes").value=cur.bytes||4;$("kib").value=cur.kib||48;$("note").textContent=cur.note||"";syncForm();render()}
@@ -499,8 +536,8 @@ function showCode(L){
   const t={python:["Python",pyText(L)],attr:["#dist.layout",attrText(L)],air:["air.api",airText(L)],mlir:["MLIR",cur.mlir||"# MLIR is embedded when the page is rendered with MLIR-AIR installed\n# (python3 examples/gallery.py). Editing the layout drops it."]};
   $("tabs").innerHTML=Object.entries(t).map(([k,[n]])=>`<button data-t="${k}" class="${k===tab?"on":""}">${n}</button>`).join("");
   $("tabs").querySelectorAll("button").forEach(b=>b.onclick=()=>{tab=b.dataset.t;showCode(L)});$("code").textContent=t[tab][1]}
-$("shape").onchange=()=>{cur.shape=parseList($("shape").value);cur.cuts=cur.cuts.filter(c=>c.axis<cur.shape.length).map(c=>{const d=Object.assign({},c);delete d.sizes;return d});delete cur.mlir;syncForm();render()};
-$("grid").onchange=()=>{cur.grid=parseList($("grid").value);cur.map=cur.grid.map((_,g)=>cur.map[g]||"");delete cur.mlir;syncForm();render()};
+$("shape").onchange=()=>{cur.shape=parseList($("shape").value);cur.cuts=cur.cuts.filter(c=>c.axis<cur.shape.length).map(c=>{const d=Object.assign({},c);delete d.sizes;return d});delete cur.mlir;delete cur.air;syncForm();render()};
+$("grid").onchange=()=>{cur.grid=parseList($("grid").value);cur.map=cur.grid.map((_,g)=>cur.map[g]||"");delete cur.mlir;delete cur.air;syncForm();render()};
 ["halo","bytes","kib"].forEach(id=>$(id).oninput=()=>{cur[id]=+$(id).value;render()});
 $("pin").onclick=()=>{if(window.__last){pinned={name:`${cur.title||"layout"} on ${cur.grid.join("×")}`,maxB:window.__last.maxB};render()}};
 $("svg").onclick=()=>{const s=$("pic").querySelector("svg");if(!s)return;const css=getComputedStyle(document.documentElement);

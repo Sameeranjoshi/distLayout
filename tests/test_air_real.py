@@ -96,3 +96,27 @@ def test_2d_block_builds():
     v = bind(_Shape(64, 128), Decomposition(Block(0, 2), Block(1, 2)), Map(Grid((2, 2)), {0: 0, 1: 1}))
     text = _build_copy(v, (2, 2), 1)
     assert "memref<32x64xf32, 2" in text        # one quarter per core
+
+
+# -- category 2: owner maps through the schedule ---------------------------------
+
+from distlayout import OwnerMap, block_cyclic, cyclic, refine, skew  # noqa: E402
+
+OWNER_MAP_CASES = {
+    "cyclic": (lambda: bind(_Shape(64), *cyclic(64, 4)), "(s0 mod 4 + s1 * 4)", 1),
+    "block_cyclic": (lambda: bind(_Shape(256), *block_cyclic(256, 16, 4)), "((s0 mod 4) * 16 + s1 * 64)", 1),
+    "skew": (lambda: bind(_Shape(16, 16), *skew((16, 16), 4)), "((s0 - s1) mod 4 + s2 * 4)", 2),
+    "tile_split": (lambda: bind(_Shape(16, 16), Decomposition(Block(0, 4), Block(1, 4)),
+                                OwnerMap(Grid(4), {0: "(t0 + 2*t1) mod 4"})), "mod 4", 1),
+    "refine": (lambda: refine(bind(_Shape(1024), Decomposition(Block(0, 4)), Map(Grid(4), {0: 0})), axis=0, k=2),
+               "* 256", None),
+}
+
+
+@pytest.mark.parametrize("name", sorted(OWNER_MAP_CASES))
+def test_owner_map_copy_kernel_builds(name):
+    make, offset_text, loops = OWNER_MAP_CASES[name]
+    text = str(air_backend.copy_kernel(make(), name=name).build(target="npu2"))
+    assert offset_text in text                      # the inverted owner map reaches the DMA offset
+    if loops is not None:
+        assert text.count("scf.for") >= loops       # one sequential loop per piece coordinate solved by a loop

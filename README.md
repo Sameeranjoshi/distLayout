@@ -51,18 +51,21 @@ with air.herd(air_backend.herd_space(view), shape=(2,)) as h:
 
 | Category | Feature | Core (Python) | Explorer | AIR backend |
 |---|---|---|---|---|
-| 1. Structured sharding | Block | ✅ | ✅ | ✅ (byte-identical to upstream) |
-| | Uneven block | ✅ | ✅ | ❌ (on hold) |
+| 1. Structured sharding | Block | ✅ | ✅ | ✅ byte-identical to upstream eltwise_add |
+| | Uneven block | ✅ | ✅ | ❌ not yet (needs per-core sizes: padding or branches) |
 | | Replication | ✅ | ✅ | ✅ |
-| | Rectangular halo (`plan`) | ✅ | ✅ | ❌ (on hold) |
+| | Rectangular halo (`plan`) | ✅ | ✅ | ❌ not yet |
 | | All-reduce, all-to-all | ⏸ on hold (compute-side collectives) | | |
-| 2. Affine owner maps | `OwnerMap` + quasi-affine `expr` (`+ - *const floordiv mod`) | ✅ | ✅ | ❌ (on hold; placement-shaped maps emit) |
-| | Cyclic, block-cyclic, skew, tile split | ✅ | ✅ | ❌ (on hold) |
-| | Several pieces per PE (local `(slot, *tile)`) | ✅ | ✅ | ❌ |
-| | Rank splitting `refine(view, axis, k)` → `owner(tx, ty)` | ✅ | ✅ | ✅ when the result is a placement |
+| 2. Affine owner maps | `OwnerMap` + quasi-affine `expr` (`+ - *const floordiv mod`) | ✅ | ✅ | ✅ via owner-map inversion (`backends/schedule.py`) |
+| | Cyclic, block-cyclic, skew, tile split | ✅ | ✅ | ✅ `air.sequential` loops over each PE's pieces; built with real `air.api` |
+| | Several pieces per PE (local `(slot, *tile)`) | ✅ | ✅ | ✅ `for_each_piece`, `load_local` / `store_local` |
+| | Rank splitting `refine(view, axis, k)` → `owner(tx, ty)` | ✅ | ✅ | ✅ |
+| | Owner maps with no unit coefficient, or pieces not dividing evenly over PEs | ✅ | ✅ | ❌ refused with a reason (would need lookup tables or guards) |
 | 3. Irregular | Owner arrays, graph partitions, ghost sets, import/export, inspector–executor | ❌ | ❌ | ❌ |
 | Transitions | `redistribute`, `plan_redistribution` | ❌ | ❌ | ❌ |
 | Native MLIR | `#dist.layout` attribute, `dist.bind` op | text only (`to_attr`) | | |
+
+AIR emission is checked by building kernels with the real `air.api` (`tests/test_air_real.py`). Nothing has been compiled for or run on an NPU yet.
 
 ## Owner maps (category 2)
 
@@ -81,6 +84,27 @@ refine(rank_view, axis=0, k=2)             # owner = [g0 = t0 floordiv 2, g1 = t
 - Expressions use MLIR's quasi-affine language and print in its syntax (`(t0 floordiv 2) mod 4`).
 - Grid axes without an expression are replicated, and must be listed in `replicate=`.
 - When a PE holds several pieces, every local buffer is a stack of tiles, `(slot, *tile)`. With tiles of different sizes it is flat.
+
+### Owner maps to AIR
+
+The herd body runs *on* a PE, so the backend inverts the owner map: "I am PE `tx`; my s-th piece is `t(tx, s)`". `distlayout.backends.schedule.solve` does this in closed form for:
+- bare coordinates;
+- `floordiv`/`mod` pairs (refine);
+- `(linear) mod P` with a ±1 coefficient.
+
+Each schedule is checked by enumeration against the layout before anything is emitted.
+
+```python
+with air.herd(air_backend.herd_space(view)) as h:
+    @h.body
+    def _(tx):
+        a = air.alloc(tile, f32, scope=h.private())           # one tile, reused
+        def per_piece(slot, key):                             # key: this piece's window of l2
+            air.ops.load(a, l2_in[key]); ...; air.ops.store(a, l2_out[key])
+        air_backend.for_each_piece(view, (tx,), per_piece)    # air.sequential loops over my pieces
+```
+
+For block-cyclic 256/16 over 4 PEs this emits `scf.for` with `affine_map<()[s0, s1] -> ((s0 mod 4) * 16 + s1 * 64)>`. `air_backend.copy_kernel(view)` builds a complete L3 → L2 → layout → L2 → L3 kernel for any emittable layout; running it must return its input.
 
 ## Visualize
 

@@ -136,6 +136,7 @@ def test_refine_uneven_and_keeps_replication():
     assert split.holders(7) == ((1, 0, 0), (1, 1, 0)) and split.holders(8) == ((1, 0, 1), (1, 1, 1))
 
 
-def test_air_backend_refuses_owner_maps_for_now():
-    with pytest.raises(NotImplementedError, match="owner maps"):
+def test_air_region_api_is_placement_only():
+    # owner maps have several pieces per PE: no single region, use for_each_piece / load_local
+    with pytest.raises(NotImplementedError, match="owner map"):
         air_backend.slice_key(bind(Buf(16), *cyclic(16, 4)), (0,))
