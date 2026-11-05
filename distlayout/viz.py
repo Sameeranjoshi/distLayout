@@ -302,39 +302,73 @@ function formula(L,idx){
   const parts=L.rules.map((r,k)=>r.ax.kind==="block"?`p${k} = i${r.axis} // ${r.sizes[0]} = ${pid[k]}`:
     `p${k} = part holding i${r.axis} in [${r.sizes.join(", ")}] = ${pid[k]}`);
   const pe=L.primaryOf(pid), hs=L.holdersOf(pid).map(L.peIx);
-  return `element (${idx.join(", ")}): ${parts.join(";  ")||"whole tensor"}  →  owner PE ${L.peIx(pe)} (${pe.join(", ")})`+(hs.length>1?`, held by ${hs.length} PEs`:"");
+  return `element (${idx.join(", ")}): ${parts.join(";  ")||"one piece"}  →  piece ${pname(pid)}  →  PE ${L.peIx(pe)} (${pe.join(", ")})`+(hs.length>1?`, held by ${hs.length} PEs`:"");
 }
 
 // ---------- drawing (SVG) ----------
+function pname(pid){return pid.length===0?"P":pid.length===1?`P${pid[0]}`:`P(${pid.join(",")})`}
 function draw(L){
-  const W=Math.min(820,$("pic").clientWidth||820), h=+L.spec.halo||0, bytes=+L.spec.bytes||4, budget=(+L.spec.kib||48)*1024;
-  const rank=L.shape.length;
+  const W=Math.min(860,$("pic").clientWidth||860), h=+L.spec.halo||0, bytes=+L.spec.bytes||4, budget=(+L.spec.kib||48)*1024;
+  const rank=L.shape.length, ink="var(--ink)", muted="var(--muted)";
+  const cap=(x,y,t)=>`<text x="${x}" y="${y}" font-size="12" font-weight="600" fill="${ink}">${t}</text>`;
+  const sub=(x,y,t)=>`<text x="${x}" y="${y}" font-size="11.5" fill="${muted}">${t}</text>`;
+  let s="";
+  // ① decomposition template: the cutter, no PEs yet
+  const TW=Math.max(150,Math.min(220,Math.floor(W*0.26))), ty0=30;
+  let tw0,th0;
+  let toScale=true;
+  if(rank===1){tw0=TW;th0=34}else{const sc0=Math.min(TW/L.shape[1],150/L.shape[0]);tw0=L.shape[1]*sc0;th0=L.shape[0]*sc0;
+    if(tw0<TW*0.3||th0<44){toScale=false;tw0=Math.max(tw0,TW*0.45);th0=Math.max(th0,Math.min(150,18*Math.max(2,...L.rules.filter(r=>r.axis===0).map(r=>r.sizes.length))))}}
+  const fx=v=>v/(rank===1?L.shape[0]:L.shape[1])*tw0, fy=v=>rank===1?0:v/L.shape[0]*th0;
+  s+=cap(0,14,"① Decompose")+`<rect x="0.5" y="${ty0+.5}" width="${tw0}" height="${th0}" fill="var(--bg)" stroke="${ink}" stroke-width="1.2" rx="3"/>`;
+  L.rules.forEach(r=>{r.starts.slice(1,-1).forEach(v=>{
+    if(rank===1||r.axis===1){const x=fx(v)+.5;s+=`<line x1="${x}" y1="${ty0}" x2="${x}" y2="${ty0+th0}" stroke="${ink}" stroke-width="1.4" stroke-dasharray="5 3"/>`}
+    else{const y=ty0+fy(v)+.5;s+=`<line x1="0" y1="${y}" x2="${tw0}" y2="${y}" stroke="${ink}" stroke-width="1.4" stroke-dasharray="5 3"/>`}})});
+  L.pids.forEach(pid=>{const r=L.region(pid);const x1=fx(rank===1?r.lo[0]:r.lo[1]),x2=fx(rank===1?r.hi[0]:r.hi[1]),y1=rank===1?0:fy(r.lo[0]),y2=rank===1?th0:fy(r.hi[0]);
+    const lab=pname(pid);if(x2-x1>=lab.length*6.5&&y2-y1>=14)s+=`<text x="${(x1+x2)/2}" y="${ty0+(y1+y2)/2+4}" font-size="11" fill="${muted}" text-anchor="middle">${lab}</text>`});
+  const rulesTxt=L.rules.length?L.rules.map(r=>ruleRepr(r)):["Decomposition(): one piece"];
+  if(!toScale)rulesTxt.push("(not to scale)");
+  rulesTxt.forEach((t,k)=>s+=sub(0,ty0+th0+18+k*15,t));
+  const tBottom=ty0+th0+18+(rulesTxt.length-1)*15;
+  // ② the tensor, cut by the same structure
+  const X0=TW+46, AW=W-X0;
   let rows,cols,at0;
   if(rank===1){const n=L.shape[0],b=L.rules.length?Math.max(...L.rules[0].sizes):n;const w=b<=64?b:64;cols=Math.min(n,w);rows=Math.ceil(n/cols);at0=(r,c)=>r*cols+c<n?[r*cols+c]:null}
   else{rows=L.shape[0];cols=L.shape[1];at0=(r,c)=>[r,c]}
-  // sample big tensors: at most 64 columns x 48 rows of cells
-  const sr=Math.ceil(rows/48), sc=Math.ceil(cols/64), at=(r,c)=>at0(r*sr,c*sc);
+  const sr=Math.ceil(rows/48), sc=Math.ceil(cols/64), at=(r,c)=>at0(r*sr,c*sc);   // sample big tensors
   rows=Math.ceil(rows/sr);cols=Math.ceil(cols/sc);
-  const cs=Math.max(4,Math.min(26,Math.floor(W/cols)-2)), gap=cs>8?2:1, tw=cols*(cs+gap), th=rows*(cs+gap);
-  let s=`<text x="0" y="13" font-size="12" fill="var(--muted)">Tensor ${L.shape.join(" × ")} — each element colored by its owner${sr>1||sc>1?` (showing every ${rank===1?sr*sc:[sr,sc].join(" × ")}th)`:""}</text>`;
-  const y0=22;
-  for(let r=0;r<rows;r++)for(let c=0;c<cols;c++){const idx=at(r,c);if(!idx)continue;const pid=L.partOf(idx),pi=L.pidIx(pid),pe=L.peIx(L.primaryOf(pid));
-    s+=`<rect class="el" data-i="${idx}" data-p="${pi}" x="${c*(cs+gap)}" y="${y0+r*(cs+gap)}" width="${cs}" height="${cs}" rx="${cs>10?3:1}" fill="${colorOf(L,pi)}"/>`;
-    if(cs>=18)s+=`<text pointer-events="none" x="${c*(cs+gap)+cs/2}" y="${y0+r*(cs+gap)+cs/2+4}" font-size="10" font-weight="600" fill="#fff" text-anchor="middle">${pe}</text>`}
-  // PE grid
+  const cs=Math.max(4,Math.min(26,Math.floor(AW/cols)-2)), gap=cs>8?2:1, step=cs+gap, tw=cols*step, th=rows*step;
+  s+=`<path d="M${TW+10},${ty0+th0/2} h22" stroke="${muted}" stroke-width="1.5" marker-end="url(#ahm)"/>`;
+  s+=cap(X0,14,`② Cut the tensor ${L.shape.join(" × ")}`)+sub(X0+190,14,sr>1||sc>1?`showing every ${rank===1?sr*sc:[sr,sc].join(" × ")}th element`:"");
+  const y0=ty0, pidAt=[], box={};
+  for(let r=0;r<rows;r++){pidAt.push([]);for(let c=0;c<cols;c++){const idx=at(r,c);if(!idx){pidAt[r].push(-1);continue}
+    const pi=L.pidIx(L.partOf(idx));pidAt[r].push(pi);
+    const x=X0+c*step,y=y0+r*step;const bb=box[pi]=box[pi]||[x,y,x,y];bb[0]=Math.min(bb[0],x);bb[1]=Math.min(bb[1],y);bb[2]=Math.max(bb[2],x+cs);bb[3]=Math.max(bb[3],y+cs);
+    s+=`<rect class="el" data-i="${idx}" data-p="${pi}" x="${x}" y="${y}" width="${cs}" height="${cs}" rx="${cs>10?3:1}" fill="${colorOf(L,pi)}"/>`}}
+  // dashed cuts wherever neighboring cells belong to different pieces
+  let cuts="";
+  for(let r=0;r<rows;r++)for(let c=0;c<cols;c++){const p0=pidAt[r][c];if(p0<0)continue;
+    if(c+1<cols&&pidAt[r][c+1]>=0&&pidAt[r][c+1]!==p0){const x=X0+(c+1)*step-gap/2;cuts+=`M${x},${y0+r*step-gap/2}v${step}`}
+    if(r+1<rows&&pidAt[r+1][c]>=0&&pidAt[r+1][c]!==p0){const y=y0+(r+1)*step-gap/2;cuts+=`M${X0+c*step-gap/2},${y}h${step}`}}
+  s+=`<path d="${cuts}" fill="none" stroke="${ink}" stroke-width="1.6" stroke-dasharray="5 3" pointer-events="none"/>`;
+  Object.entries(box).forEach(([pi,[x1,y1,x2,y2]])=>{const lab=pname(L.pids[+pi]),lw=lab.length*7+10;if(x2-x1>=lw+4&&y2-y1>=16){
+    const cx=(x1+x2)/2,cy=(y1+y2)/2;
+    s+=`<g pointer-events="none"><rect x="${cx-lw/2}" y="${cy-9}" width="${lw}" height="18" rx="9" fill="rgba(23,37,60,.78)"/><text x="${cx}" y="${cy+4}" font-size="11.5" font-weight="700" fill="#fff" text-anchor="middle">${lab}</text></g>`}});
+  // ③ PE grid
   const G=L.grid, gr=G.length>1?G.slice(0,-1).reduce((a,b)=>a*b,1):1, gc=G[G.length-1];
-  const bw=Math.max(92,Math.min(150,Math.floor((W-8)/gc)-12)), bh=58, bg=h?34:12, py=y0+th+40;
-  s+=`<text x="0" y="${py-12}" font-size="12" fill="var(--muted)">PE grid ${G.join(" × ")} — region held, memory used${h?` (with halo ${h})`:""}</text>`;
+  const bw=Math.max(96,Math.min(150,Math.floor((W-8)/gc)-12)), bh=58, bg=h?34:12, py=Math.max(y0+th,tBottom)+48;
+  s+=cap(0,py-14,`③ Map pieces to PEs: grid ${G.join(" × ")}`)+sub(230,py-14,`region held, memory used${h?` (with halo ${h})`:""}${realRep(L).length?`; replicated over ${realRep(L).map(g=>"g"+g).join(", ")}`:""}`);
   const pos={};let maxB=0,over=0;
   L.pes.forEach(pe=>{const i=L.peIx(pe),row=G.length>1?Math.floor(i/gc):0,col=i%gc,x=col*(bw+bg),y=py+row*(bh+bg);pos[i]=[x+bw/2,y+bh/2];
     const pid=L.partAt(pe),pi=L.pidIx(pid),pl=plan(L,pe,h),b=vol(pl.req)*bytes;maxB=Math.max(maxB,b);if(b>budget)over++;
     const frac=Math.min(1,b/budget),col2=colorOf(L,pi);
     s+=`<g class="pe" data-p="${pi}" data-pe="${i}"><rect x="${x}" y="${y}" width="${bw}" height="${bh}" rx="7" fill="${col2}" ${L.isPrimary(pe)?"":`fill-opacity=".55"`}/>`+
-      `<text x="${x+8}" y="${y+16}" font-size="12" font-weight="700" fill="#fff">PE ${i}${L.isPrimary(pe)?"":" · replica"}</text>`+
+      `<text x="${x+8}" y="${y+16}" font-size="12" font-weight="700" fill="#fff">PE ${i} ← ${pname(pid)}${L.isPrimary(pe)?"":" · replica"}</text>`+
       `<text x="${x+8}" y="${y+31}" font-size="11" fill="#fff">${rstr(pl.held)}</text>`+
-      `<rect x="${x+8}" y="${y+40}" width="${bw-16}" height="8" rx="3" fill="rgba(255,255,255,.35)"/>`+
-      `<rect x="${x+8}" y="${y+40}" width="${(bw-16)*frac}" height="8" rx="3" fill="${b>budget?"#D95455":"#fff"}"/>`+
-      `<title>PE ${i} (${pe}) holds ${rstr(pl.held)}${h?`, needs ${rstr(pl.req)}`:""}: ${fmtB(b)} of ${fmtB(budget)}</title></g>`});
+      `<rect x="${x+8}" y="${y+40}" width="${bw-52}" height="8" rx="3" fill="rgba(255,255,255,.35)"/>`+
+      `<rect x="${x+8}" y="${y+40}" width="${(bw-52)*frac}" height="8" rx="3" fill="${b>budget?"#17253C":"#fff"}"/>`+
+      `<text x="${x+bw-8}" y="${y+48}" font-size="10" font-weight="${b>budget?700:400}" fill="#fff" text-anchor="end">${b>budget?"✕ ":""}${fmtB(b)}</text>`+
+      `<title>PE ${i} (${pe}) holds piece ${pname(pid)} = ${rstr(pl.held)}${h?`, needs ${rstr(pl.req)}`:""}: ${fmtB(b)} of ${fmtB(budget)}</title></g>`});
   // import arrows (halo)
   let arrows="";const pair={};
   if(h)L.pes.forEach(pe=>{const dst=L.peIx(pe);plan(L,pe,h).pieces.filter(p=>!p.local).forEach(p=>{const a=Math.min(p.src,dst),b=Math.max(p.src,dst),k=a+"-"+b;
@@ -343,11 +377,11 @@ function draw(L){
   Object.values(pair).forEach(({a,b,n,dirs})=>{const [x1,y1]=pos[a],[x2,y2]=pos[b],dx=x2-x1,dy=y2-y1;
     const [sx,sy]=edge(x1,y1,dx,dy),[ex,ey]=edge(x2,y2,-dx,-dy),diag=Math.abs(dx)>1&&Math.abs(dy)>1;
     arrows+=`<line x1="${sx}" y1="${sy}" x2="${ex}" y2="${ey}" stroke="#D95455" stroke-width="${diag?1.2:2.2}" ${diag?'stroke-dasharray="4 3"':""} ${dirs.has("ab")?'marker-end="url(#ah)"':""} ${dirs.has("ba")?'marker-start="url(#ah2)"':""}><title>PE ${a} ⇄ PE ${b}: ${n} halo elements</title></line>`});
-  const ph=(gr)*(bh+bg), H=py+ph+4, PW=Math.max(tw,gc*(bw+bg));
-  const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="${PW}" height="${H}" viewBox="0 0 ${PW} ${H}"><defs><marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0L10,5L0,10z" fill="#D95455"/></marker><marker id="ah2" viewBox="0 0 10 10" refX="2" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M10,0L0,5L10,10z" fill="#D95455"/></marker></defs>${s}${arrows}</svg>`;
+  const ph=(gr)*(bh+bg), H=py+ph+4, PW=Math.max(X0+tw,gc*(bw+bg),TW);
+  const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="${PW}" height="${H}" viewBox="0 0 ${PW} ${H}"><defs><marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0L10,5L0,10z" fill="#D95455"/></marker><marker id="ahm" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#52657B"/></marker><marker id="ah2" viewBox="0 0 10 10" refX="2" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M10,0L0,5L10,10z" fill="#D95455"/></marker></defs>${s}${arrows}</svg>`;
   $("pic").innerHTML=`<div style="overflow-x:auto">${svg}</div>`;
   // legend & stats
-  $("legend").innerHTML=L.pids.slice(0,12).map(pid=>{const pi=L.pidIx(pid),hs=L.holdersOf(pid).length;return `<span><i class="sw" style="background:${colorOf(L,pi)}"></i>${rstr(L.region(pid))} → PE ${L.peIx(L.primaryOf(pid))}${hs>1?` +${hs-1}`:""}</span>`}).join("")+(L.pids.length>12?`<span>… ${L.pids.length-12} more</span>`:"")+(h?`<span><i class="sw" style="background:#D95455"></i>halo import</span>`:"");
+  $("legend").innerHTML=L.pids.slice(0,12).map(pid=>{const pi=L.pidIx(pid),hs=L.holdersOf(pid).length;return `<span><i class="sw" style="background:${colorOf(L,pi)}"></i>${pname(pid)} ${rstr(L.region(pid))} → PE ${L.peIx(L.primaryOf(pid))}${hs>1?` +${hs-1} replica${hs>2?"s":""}`:""}</span>`}).join("")+(L.pids.length>12?`<span>… ${L.pids.length-12} more</span>`:"")+(h?`<span><i class="sw" style="background:#D95455"></i>halo import</span>`:"");
   L.maxB=maxB;
   const fit=over?`<b style="color:var(--comm)">${over} PE${over>1?"s":""} over budget</b>`:`<b style="color:var(--ok)">fits</b>`;
   $("stat").innerHTML=`max ${fmtB(maxB)} / PE of ${fmtB(budget)} · ${fit}`+(pinned?` · vs A (${pinned.name}): ${fmtB(pinned.maxB)} / PE → ${maxB<=pinned.maxB?(pinned.maxB/maxB).toFixed(2)+"× less":(maxB/pinned.maxB).toFixed(2)+"× more"}`:"");
@@ -359,7 +393,8 @@ function draw(L){
   function unhl(){svgEl.querySelectorAll(".el,.pe").forEach(e=>e.style.opacity="");$("formula").textContent=hint(L)}
   $("formula").textContent=hint(L);
 }
-function hint(L){return L.rules.length?"hover an element for its owner formula; "+L.rules.map((r,k)=>r.ax.kind==="block"?`p${k} = i${r.axis} // ${r.sizes[0]}`:`p${k} from sizes [${r.sizes.join(", ")}]`).join(", ")+(L.replicate.length?`; replicated over ${L.replicate.map(g=>"g"+g).join(", ")}`:""):"every PE holds the whole tensor; owner is PE 0"}
+function hint(L){return L.rules.length?"hover an element for its owner formula; "+L.rules.map((r,k)=>r.ax.kind==="block"?`p${k} = i${r.axis} // ${r.sizes[0]}`:`p${k} from sizes [${r.sizes.join(", ")}]`).join(", ")+(realRep(L).length?`; replicated over ${realRep(L).map(g=>"g"+g).join(", ")}`:""):"every PE holds the whole tensor; owner is PE 0"}
+function realRep(L){return L.replicate.filter(g=>L.grid[g]>1)}
 function fmtB(b){return b>=1024?(b/1024).toFixed(b%1024?1:0)+" KiB":b+" B"}
 
 // ---------- UI ----------
@@ -387,7 +422,8 @@ function showCode(L){
 ["halo","bytes","kib"].forEach(id=>$(id).oninput=()=>{cur[id]=+$(id).value;render()});
 $("pin").onclick=()=>{if(window.__last){pinned={name:`${cur.title||"layout"} on ${cur.grid.join("×")}`,maxB:window.__last.maxB};render()}};
 $("svg").onclick=()=>{const s=$("pic").querySelector("svg");if(!s)return;const css=getComputedStyle(document.documentElement);
-  let txt=new XMLSerializer().serializeToString(s).replace(/var\(--muted\)/g,css.getPropertyValue("--muted").trim()||"#52657B");
+  const v=(n,d)=>css.getPropertyValue(n).trim()||d;
+  let txt=new XMLSerializer().serializeToString(s).replace(/var\(--muted\)/g,v("--muted","#52657B")).replace(/var\(--ink\)/g,v("--ink","#17253C")).replace(/var\(--bg\)/g,v("--bg","#FFFFFF"));
   const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([txt],{type:"image/svg+xml"}));a.download=(cur.title||"layout").replace(/\W+/g,"_")+".svg";a.click()};
 const P=$("presets");PRESETS.forEach((p,i)=>{const b=document.createElement("button");b.textContent=p.title||`Layout ${i+1}`;
   b.onclick=()=>{P.querySelectorAll("button").forEach(x=>x.classList.remove("on"));b.classList.add("on");load(p)};P.appendChild(b)});

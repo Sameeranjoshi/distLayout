@@ -55,9 +55,9 @@ python3 examples/gallery.py          # writes docs/explorer.html, open it in a b
 
 `docs/explorer.html` is one self-contained page with no network or dependencies:
 
-- **Presets:** Block, Block + replicate, Uneven, Replicate, 2-D block, 2-D halo, Rank split, eltwise_add.
+- **Presets:** Block, Block + replicate, Uneven, Replicate, 2-D block, Transposed mapping, 2-D halo, Rank split, eltwise_add.
 - **Builder:** tensor shape, PE grid, and for each tensor axis *whole* or *block/uneven → grid axis g*. Grid axes with nothing placed on them are replicated. Halo radius, bytes per element and PE memory are also editable, and errors are explained inline.
-- **Picture:** the tensor colored by owner; hover an element for its owner formula and holders. Below it, the PE grid with memory-fit bars against the PE budget and red arrows for halo imports.
+- **Picture, in three steps:** ① *Decompose*: a neutral cutter, the tensor's outline with dashed cut lines and piece names (`P2`, `P(1,0)`), no PEs yet. ② *Cut the tensor*: the same dashed cuts over the elements, each piece in its own color; hover an element for its formula (`p0 = i0 // 8 … → piece P(1,0) → PE 1`). ③ *Map pieces to PEs*: each card says which piece it got (`PE 1 ← P(1,0)`), with a memory-fit bar against the PE budget and red arrows for halo imports. The *Transposed mapping* preset uses the same cuts as *2-D block* but a different mapping.
 - **Code tabs:** Python spec · `#dist.layout` · `air.api` herd body · MLIR (the real module, when rendered with MLIR-AIR installed).
 - **Pin as A** to compare bytes/PE with the current layout. In *Rank split*, pin at 8 × 1, then set the grid to 8 × 4.
 - **Export SVG** of the picture.

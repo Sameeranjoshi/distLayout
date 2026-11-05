@@ -49,6 +49,9 @@ def presets():
         ("Replicate", bind(Buf(100), Decomposition(), Replicate(Grid((4, 4)))),
          {"note": "Nothing is split, so every PE holds the whole tensor; PE 0 is the owner."}),
         ("2-D block", v2, {"note": "16 × 32 in 2 × 2 tiles: axis 0 over g0, axis 1 over g1."}),
+        ("Transposed mapping", bind(Buf(16, 32), Decomposition(Block(0, 2), Block(1, 2)), Map(Grid((2, 2)), {0: 1, 1: 0})),
+         {"note": "The same 2 × 2 cuts as 2-D block, mapped differently: tensor axis 0 goes over grid axis g1. "
+                  "Piece P(1,0) now lands on PE 1, not PE 2. Cutting and mapping are separate choices."}),
         ("2-D halo", v2, {"halo": 1, "note": "Each PE also needs a 1-cell halo around its tile. Red arrows are "
                                              "the imports; memory bars include the halo."}),
         ("Rank split", bind(Buf(8, 4096), Decomposition(Block(0, 8), Block(1, 1)), Map(Grid((8, 1)), {0: 0, 1: 1})),
