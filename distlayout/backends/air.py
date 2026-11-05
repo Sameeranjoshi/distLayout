@@ -47,7 +47,18 @@ def _air():
     return api
 
 
+def _placement(view: DistributedView):
+    from ..mapping import as_placement
+    return as_placement(view.mapping, view.decomposition.num_parts(view.shape))
+
+
 def _check_emittable(view: DistributedView) -> None:
+    from ..mapping import as_placement
+    pm = as_placement(view.mapping, view.decomposition.num_parts(view.shape))
+    if pm is None:
+        raise NotImplementedError(
+            f"owner maps ({view.mapping!r}) are not emitted to AIR yet; the AIR backend handles "
+            f"placement maps (Map / Replicate) only")
     if not view.is_uniform():
         sizes = sorted({view.local_shape(pe) for pe in view.grid.coords()})
         raise NotImplementedError(
@@ -71,7 +82,7 @@ def offsets(view: DistributedView, coords: Sequence[Any]) -> Tuple[Any, ...]:
     if len(coords) != view.grid.rank:
         raise ValueError(f"got {len(coords)} herd coordinates for a rank-{view.grid.rank} grid")
     rule_on_axis = {r.axis: (k, r) for k, r in enumerate(view.decomposition.rules)}
-    placed = view.mapping.place_dict
+    placed = _placement(view).place_dict
     out: List[Any] = []
     for a, extent in enumerate(view.shape):
         base = -view.source.origin[a]
@@ -127,7 +138,7 @@ def herd_space(view: DistributedView) -> List[range]:
     A replicated axis gives ``range(0, k)``.
     """
     _check_emittable(view)
-    placed = {g: k for k, g in view.mapping.place}
+    placed = {g: k for k, g in _placement(view).place}
     size = view.local_shape(next(view.grid.coords()))
     out = []
     for g, extent in enumerate(view.grid.shape):

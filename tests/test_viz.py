@@ -58,7 +58,15 @@ def test_page_is_self_contained():
     assert page.startswith("<!doctype html>")
     assert not re.search(r"<(script|link)[^>]+(src|href)=", page)     # nothing loaded from outside
     presets_json = json.loads(re.search(r"const PRESETS=(\[.*?\]), COLORS", page, re.S).group(1))
-    assert presets_json[0]["mlir"] == "module {}" and presets_json[0]["axes"] == [{"kind": "block", "g": 0}]
+    assert presets_json[0]["mlir"] == "module {}"
+    assert presets_json[0]["cuts"] == [{"axis": 0, "kind": "block", "parts": 4}] and presets_json[0]["map"] == ["t0"]
+
+
+def test_to_spec_renumbers_cuts_into_axis_order():
+    from distlayout import OwnerMap
+    v = bind(Buf(4, 6), Decomposition(Block(1, 3), Block(0, 2)), OwnerMap(Grid((2, 3)), {0: "t1", 1: "t0"}))
+    spec = to_spec(v)
+    assert [c["axis"] for c in spec["cuts"]] == [0, 1] and spec["map"] == ["t0", "t1"]
 
 
 def test_to_spec_rejects_what_it_cannot_draw():
@@ -70,9 +78,12 @@ def test_to_spec_rejects_what_it_cannot_draw():
 
 def _python_facts(view, halo):
     owners = [_pe_ix(view, view.primary_owner(i)) for i in Box.full(view.shape).indices()]
-    held = [_box(view.held_region(pe)) for pe in view.grid.coords()]
+    held = [[_box(r) for r in view.held_regions(pe)] for pe in view.grid.coords()]
     plans = []
     for pe in view.grid.coords():
+        if len(view.pieces_at(pe)) != 1:
+            plans.append(None)
+            continue
         r = view.held_region(pe)
         req = Box.from_bounds([max(0, o - halo) for o in r.offset], [min(n, s + halo) for s, n in zip(r.stop, view.shape)])
         plans.append(sorted([_box(t.region), t.local, None if t.local else _pe_ix(view, t.src_pe)]
@@ -102,9 +113,9 @@ const { chromium } = require('playwright');
     const all = (shape) => shape.reduce((acc, n) => acc.flatMap(a => [...Array(n).keys()].map(x => a.concat([x]))), [[]]);
     return {
       owners: all(L.shape).map(i => L.peIx(L.primaryOf(L.partOf(i)))),
-      held: L.pes.map(pe => { const r = L.region(L.partAt(pe)); return [r.lo, r.hi]; }),
-      plans: L.pes.map(pe => D.plan(L, pe, +spec.halo || 0).pieces
-        .map(x => [[x.r.lo, x.r.hi], x.local, x.local ? null : x.src])),
+      held: L.pes.map(pe => L.piecesAt(pe).map(p => { const r = L.region(p); return [r.lo, r.hi]; })),
+      plans: L.pes.map(pe => { const pl = D.plan(L, pe, +spec.halo || 0);
+        return pl ? pl.pieces.map(x => [[x.r.lo, x.r.hi], x.local, x.local ? null : x.src]) : null; }),
       attr: D.attrText(L), py: D.pyText(Object.assign({}, L, { spec: Object.assign({}, spec, { src: 'SRC' }) })),
     };
   }));
@@ -133,7 +144,7 @@ def test_page_agrees_with_python(tmp_path):
     assert len(js) == len(entries)
     for (name, view, kw), got in zip(entries, js):
         want = _python_facts(view, kw.get("halo", 0))
-        got["plans"] = [sorted(pl) for pl in got["plans"]]
+        got["plans"] = [None if pl is None else sorted(pl) for pl in got["plans"]]
         for key in ("owners", "held", "attr", "py"):
             assert got[key] == want[key], f"{name}: {key} differs"
         assert got["plans"] == want["plans"], f"{name}: halo plans differ"

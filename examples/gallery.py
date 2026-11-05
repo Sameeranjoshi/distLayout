@@ -11,7 +11,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from distlayout import Block, Decomposition, Grid, Map, Replicate, UnevenBlock, bind  # noqa: E402
+from distlayout import (Block, Decomposition, Grid, Map, OwnerMap, Replicate, UnevenBlock, bind,  # noqa: E402
+                        block_cyclic, cyclic, refine, skew)
 from distlayout.viz import render_explorer  # noqa: E402
 
 
@@ -36,6 +37,7 @@ def eltwise_mlir(n, tile):
 
 def presets():
     g41 = Grid((4, 1))
+    rank_view = bind(Buf(8, 4096), Decomposition(Block(0, 8)), Map(Grid(8), {0: 0}))
     v2 = bind(Buf(16, 32), Decomposition(Block(0, 2), Block(1, 2)), Map(Grid((2, 2)), {0: 0, 1: 1}))
     n, tile = 2048, 256
     return [
@@ -54,10 +56,24 @@ def presets():
                   "Piece P(1,0) now lands on PE 1, not PE 2. Cutting and mapping are separate choices."}),
         ("2-D halo", v2, {"halo": 1, "note": "Each PE also needs a 1-cell halo around its tile. Red arrows are "
                                              "the imports; memory bars include the halo."}),
-        ("Rank split", bind(Buf(8, 4096), Decomposition(Block(0, 8), Block(1, 1)), Map(Grid((8, 1)), {0: 0, 1: 1})),
+        ("Cyclic", bind(Buf(16), *cyclic(16, 4)),
+         {"note": "Cut into 16 one-element pieces, then deal them round-robin: g0 = t0 mod 4. Every PE holds 4 pieces."}),
+        ("Block-cyclic", bind(Buf(16), *block_cyclic(16, 2, 4)),
+         {"note": "Cut into 2-element blocks, then deal the blocks round-robin: g0 = t0 mod 4."}),
+        ("Skew", bind(Buf(8, 8), *skew((8, 8), 4)),
+         {"note": "1 × 1 pieces, g0 = (t0 + t1) mod 4: each row is the one above shifted by one PE."}),
+        ("Tile split", bind(Buf(8, 8), Decomposition(Block(0, 4), Block(1, 4)), OwnerMap(Grid(4), {0: "(t0 + 2*t1) mod 4"})),
+         {"note": "A structured 4 × 4 cut into 2 × 2 tiles, but tiles go to PEs by (t0 + 2·t1) mod 4: the cut "
+                  "being regular does not make the mapping regular."}),
+        ("Rank split k=1", rank_view,
          {"elem_bytes": 16, "note": "8 MPI ranks, each with a 4096-element row (16 B per element: the program's 4 "
-                               "arrays). At k = 1 a rank is one PE and needs 64 KiB > 48 KiB. Pin it, then change "
-                               "the PE grid to 8 × 2 or 8 × 4: each rank is split k ways and fits again."}),
+                                    "arrays). One rank per PE needs 64 KiB > 48 KiB. Pin it, then open 'Rank split k=4'."}),
+        ("Rank split k=4", refine(rank_view, axis=1, k=4),
+         {"elem_bytes": 16, "note": "refine(view, axis=1, k=4): each rank's row is cut 4 ways and the slices go to a "
+                                    "new grid axis, owner(tx, ty). 16 KiB per PE: fits."}),
+        ("Refine 1-D", refine(bind(Buf(64), Decomposition(Block(0, 4)), Map(Grid(4), {0: 0})), axis=0, k=2),
+         {"note": "4 ranks of 16 elements, each refined 2 ways: g0 = t0 floordiv 2 (the rank), g1 = t0 mod 2 (the "
+                  "slice). This is rank splitting written as an affine owner map."}),
         ("eltwise_add", bind(Buf(n), Decomposition(Block(0, n // tile)), Map(Grid(n // tile), {0: 0})),
          {"src": "l2_a", "mlir": eltwise_mlir(n, tile),
           "note": f"Upstream eltwise_add_with_l2, n = {n}, tile = {tile}: one block per herd point. The MLIR tab "

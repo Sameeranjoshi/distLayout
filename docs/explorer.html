@@ -8,19 +8,22 @@
 :root[data-theme="dark"]{--ink:#E8EEF6;--muted:#A9B7C8;--faint:#7D8FA3;--card:#18222F;--line:#2A3747;--bg:#0F1722;--ghost:#3C5A80;--code:#141D29}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font-family:Aptos,"Segoe UI",Inter,system-ui,-apple-system,sans-serif;font-size:14px}
-.wrap{max-width:1240px;margin:0 auto;padding:20px 16px 32px}
+.wrap{max-width:1260px;margin:0 auto;padding:20px 16px 32px}
 h1{font-size:24px;margin:0 0 12px;font-weight:700}
 .presets{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px}
 .presets button,.btn{font:inherit;font-size:13px;border:1px solid var(--line);background:var(--card);color:var(--ink);
 border-radius:8px;padding:6px 12px;cursor:pointer}
 .presets button.on{background:var(--accent);border-color:var(--accent);color:#fff}
-.main{display:grid;grid-template-columns:330px 1fr;gap:16px;align-items:start}
+.main{display:grid;grid-template-columns:340px 1fr;gap:16px;align-items:start}
 @media(max-width:860px){.main{grid-template-columns:1fr}}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;min-width:0}
-.card h2{font-size:15px;margin:0 0 10px}
-label{display:block;color:var(--muted);font-size:12px;margin:10px 0 4px}
+.card h2{font-size:15px;margin:0 0 4px}
+h3{font-size:12.5px;margin:14px 0 2px;color:var(--ink)}
+label{display:block;color:var(--muted);font-size:12px;margin:8px 0 4px}
 input,select{font:inherit;font-size:13px;width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--ink)}
-.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+input.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.row3{display:grid;grid-template-columns:1.3fr 1fr;gap:8px}
+.help{color:var(--faint);font-size:11.5px;margin:2px 0 0}
 .err{color:var(--comm);font-size:12.5px;min-height:18px;margin-top:8px}
 .tabs{display:flex;gap:4px;margin:14px 0 0;border-bottom:1px solid var(--line)}
 .tabs button{font:inherit;font-size:12.5px;border:0;background:none;color:var(--muted);padding:6px 10px;cursor:pointer;border-bottom:2px solid transparent}
@@ -41,7 +44,10 @@ svg text{font-family:Aptos,"Segoe UI",Inter,system-ui,sans-serif}
  <div class="card">
   <h2>Layout</h2>
   <div class="row"><div><label>Tensor shape</label><input id="shape"></div><div><label>PE grid</label><input id="grid"></div></div>
-  <div id="axes"></div>
+  <h3>① Cut</h3><p class="help">How each tensor axis is cut into pieces. Pieces get coordinates t0, t1, …</p>
+  <div id="cuts"></div>
+  <h3>③ Map</h3><p class="help">Grid coordinate of each piece: an expression in t0, t1, … with + − * floordiv mod. Blank = replicated.</p>
+  <div id="maps"></div>
   <div class="row"><div><label>Halo radius</label><input id="halo" type="number" min="0" value="0"></div>
    <div><label>Bytes / element · PE KiB</label><div class="row"><input id="bytes" type="number" min="1"><input id="kib" type="number" min="1"></div></div></div>
   <div class="err" id="err"></div>
@@ -56,196 +62,248 @@ svg text{font-family:Aptos,"Segoe UI",Inter,system-ui,sans-serif}
  </div>
 </div></div>
 <script>
-const PRESETS=[{"title": "Block", "note": "100 elements in 4 equal blocks, one per PE.", "shape": [100], "grid": [4, 1], "axes": [{"kind": "block", "g": 0}], "halo": 0, "bytes": 4, "kib": 48, "src": "l2"}, {"title": "Block + replicate", "note": "4 blocks on a 4 \u00d7 4 grid. Grid axis g1 holds nothing new, so each block is replicated along it (lighter cards are replicas).", "shape": [100], "grid": [4, 4], "axes": [{"kind": "block", "g": 0}], "halo": 0, "bytes": 4, "kib": 48, "src": "l2"}, {"title": "Uneven", "note": "99 elements over 4 PEs: 25, 25, 25, 24. Try 'block' on axis 0 to see why uneven is needed.", "shape": [99], "grid": [4, 1], "axes": [{"kind": "uneven", "g": 0, "policy": "balanced"}], "halo": 0, "bytes": 4, "kib": 48, "src": "l2"}, {"title": "Replicate", "note": "Nothing is split, so every PE holds the whole tensor; PE 0 is the owner.", "shape": [100], "grid": [4, 4], "axes": [{"kind": "whole"}], "halo": 0, "bytes": 4, "kib": 48, "src": "l2"}, {"title": "2-D block", "note": "16 \u00d7 32 in 2 \u00d7 2 tiles: axis 0 over g0, axis 1 over g1.", "shape": [16, 32], "grid": [2, 2], "axes": [{"kind": "block", "g": 0}, {"kind": "block", "g": 1}], "halo": 0, "bytes": 4, "kib": 48, "src": "l2"}, {"title": "Transposed mapping", "note": "The same 2 \u00d7 2 cuts as 2-D block, mapped differently: tensor axis 0 goes over grid axis g1. Piece P(1,0) now lands on PE 1, not PE 2. Cutting and mapping are separate choices.", "shape": [16, 32], "grid": [2, 2], "axes": [{"kind": "block", "g": 1}, {"kind": "block", "g": 0}], "halo": 0, "bytes": 4, "kib": 48, "src": "l2"}, {"title": "2-D halo", "note": "Each PE also needs a 1-cell halo around its tile. Red arrows are the imports; memory bars include the halo.", "shape": [16, 32], "grid": [2, 2], "axes": [{"kind": "block", "g": 0}, {"kind": "block", "g": 1}], "halo": 1, "bytes": 4, "kib": 48, "src": "l2"}, {"title": "Rank split", "note": "8 MPI ranks, each with a 4096-element row (16 B per element: the program's 4 arrays). At k = 1 a rank is one PE and needs 64 KiB > 48 KiB. Pin it, then change the PE grid to 8 \u00d7 2 or 8 \u00d7 4: each rank is split k ways and fits again.", "shape": [8, 4096], "grid": [8, 1], "axes": [{"kind": "block", "g": 0}, {"kind": "block", "g": 1}], "halo": 0, "bytes": 16, "kib": 48, "src": "l2"}, {"title": "eltwise_add", "note": "Upstream eltwise_add_with_l2, n = 2048, tile = 256: one block per herd point. The MLIR tab is the real module from air.api.", "shape": [2048], "grid": [8], "axes": [{"kind": "block", "g": 0}], "halo": 0, "bytes": 4, "kib": 48, "src": "l2_a", "mlir": "#map = affine_map<()[s0, s1] -> (s0 * 1024 + s1 * 256)>\nmodule {\n  func.func @eltwise_add(%arg0: memref<2048xf32>, %arg1: memref<2048xf32>, %arg2: memref<2048xf32>) {\n    %c1 = arith.constant 1 : index\n    %c1_0 = arith.constant 1 : index\n    air.launch (%arg3, %arg4) in (%arg5=%c1, %arg6=%c1_0) args(%arg7=%arg0, %arg8=%arg1, %arg9=%arg2) : memref<2048xf32>, memref<2048xf32>, memref<2048xf32> {\n      air.segment @segment_0  args(%arg10=%arg7, %arg11=%arg8, %arg12=%arg9) : memref<2048xf32>, memref<2048xf32>, memref<2048xf32> {\n        %alloc = memref.alloc() : memref<2048xf32, 1 : i32>\n        %alloc_1 = memref.alloc() : memref<2048xf32, 1 : i32>\n        %alloc_2 = memref.alloc() : memref<2048xf32, 1 : i32>\n        air.dma_memcpy_nd (%alloc[] [] [], %arg10[] [] []) : (memref<2048xf32, 1 : i32>, memref<2048xf32>)\n        air.dma_memcpy_nd (%alloc_1[] [] [], %arg11[] [] []) : (memref<2048xf32, 1 : i32>, memref<2048xf32>)\n        %c2 = arith.constant 2 : index\n        %c1_3 = arith.constant 1 : index\n        air.herd @herd_0  tile (%arg13, %arg14) in (%arg15=%c2, %arg16=%c1_3) args(%arg17=%alloc, %arg18=%alloc_1, %arg19=%alloc_2) : memref<2048xf32, 1 : i32>, memref<2048xf32, 1 : i32>, memref<2048xf32, 1 : i32> {\n          %c0 = arith.constant 0 : index\n          %c4 = arith.constant 4 : index\n          %c1_4 = arith.constant 1 : index\n          scf.for %arg20 = %c0 to %c4 step %c1_4 {\n            %alloc_5 = memref.alloc() : memref<256xf32, 2 : i32>\n            %alloc_6 = memref.alloc() : memref<256xf32, 2 : i32>\n            %alloc_7 = memref.alloc() : memref<256xf32, 2 : i32>\n            %0 = affine.apply #map()[%arg13, %arg20]\n            air.dma_memcpy_nd (%alloc_5[] [] [], %arg17[%0] [256] [1]) : (memref<256xf32, 2 : i32>, memref<2048xf32, 1 : i32>)\n            %1 = affine.apply #map()[%arg13, %arg20]\n            air.dma_memcpy_nd (%alloc_6[] [] [], %arg18[%1] [256] [1]) : (memref<256xf32, 2 : i32>, memref<2048xf32, 1 : i32>)\n            %cst = arith.constant 0.000000e+00 : f32\n            %c0_8 = arith.constant 0 : index\n            %c256 = arith.constant 256 : index\n            %c16 = arith.constant 16 : index\n            scf.for %arg21 = %c0_8 to %c256 step %c16 {\n              %3 = vector.transfer_read %alloc_5[%arg21], %cst {in_bounds = [true]} : memref<256xf32, 2 : i32>, vector<16xf32>\n              %4 = vector.transfer_read %alloc_6[%arg21], %cst {in_bounds = [true]} : memref<256xf32, 2 : i32>, vector<16xf32>\n              %5 = arith.addf %3, %4 : vector<16xf32>\n              vector.transfer_write %5, %alloc_7[%arg21] {in_bounds = [true]} : vector<16xf32>, memref<256xf32, 2 : i32>\n            }\n            memref.dealloc %alloc_6 : memref<256xf32, 2 : i32>\n            memref.dealloc %alloc_5 : memref<256xf32, 2 : i32>\n            %2 = affine.apply #map()[%arg13, %arg20]\n            air.dma_memcpy_nd (%arg19[%2] [256] [1], %alloc_7[] [] []) : (memref<2048xf32, 1 : i32>, memref<256xf32, 2 : i32>)\n            memref.dealloc %alloc_7 : memref<256xf32, 2 : i32>\n          }\n        }\n        memref.dealloc %alloc_1 : memref<2048xf32, 1 : i32>\n        memref.dealloc %alloc : memref<2048xf32, 1 : i32>\n        air.dma_memcpy_nd (%arg12[] [] [], %alloc_2[] [] []) : (memref<2048xf32>, memref<2048xf32, 1 : i32>)\n        memref.dealloc %alloc_2 : memref<2048xf32, 1 : i32>\n      }\n    }\n    return\n  }\n}\n"}], COLORS=["#3978CF", "#E59B38", "#249A82", "#A36BC6", "#D95455", "#52657B", "#2FA7C9", "#C58B1E", "#5E9E4A", "#7A5BC7", "#C2577F", "#3E8E8A", "#8C6A4A", "#4867B8", "#B8743A", "#6B7F99"];
+const PRESETS=[{"title": "Block", "note": "100 elements in 4 equal blocks, one per PE.", "shape": [100], "grid": [4, 1], "cuts": [{"axis": 0, "kind": "block", "parts": 4}], "map": ["t0", null], "halo": 0, "bytes": 4, "kib": 48, "src": "l2"}, {"title": "Block + replicate", "note": "4 blocks on a 4 \u00d7 4 grid. Grid axis g1 holds nothing new, so each block is replicated along it (lighter cards are replicas).", "shape": [100], "grid": [4, 4], "cuts": [{"axis": 0, "kind": "block", "parts": 4}], "map": ["t0", null], "halo": 0, "bytes": 4, "kib": 48, "src": "l2"}, {"title": "Uneven", "note": "99 elements over 4 PEs: 25, 25, 25, 24. Try 'block' on axis 0 to see why uneven is needed.", "shape": [99], "grid": [4, 1], "cuts": [{"axis": 0, "kind": "uneven", "parts": 4, "policy": "balanced"}], "map": ["t0", null], "halo": 0, "bytes": 4, "kib": 48, "src": "l2"}, {"title": "Replicate", "note": "Nothing is split, so every PE holds the whole tensor; PE 0 is the owner.", "shape": [100], "grid": [4, 4], "cuts": [], "map": [null, null], "halo": 0, "bytes": 4, "kib": 48, "src": "l2"}, {"title": "2-D block", "note": "16 \u00d7 32 in 2 \u00d7 2 tiles: axis 0 over g0, axis 1 over g1.", "shape": [16, 32], "grid": [2, 2], "cuts": [{"axis": 0, "kind": "block", "parts": 2}, {"axis": 1, "kind": "block", "parts": 2}], "map": ["t0", "t1"], "halo": 0, "bytes": 4, "kib": 48, "src": "l2"}, {"title": "Transposed mapping", "note": "The same 2 \u00d7 2 cuts as 2-D block, mapped differently: tensor axis 0 goes over grid axis g1. Piece P(1,0) now lands on PE 1, not PE 2. Cutting and mapping are separate choices.", "shape": [16, 32], "grid": [2, 2], "cuts": [{"axis": 0, "kind": "block", "parts": 2}, {"axis": 1, "kind": "block", "parts": 2}], "map": ["t1", "t0"], "halo": 0, "bytes": 4, "kib": 48, "src": "l2"}, {"title": "2-D halo", "note": "Each PE also needs a 1-cell halo around its tile. Red arrows are the imports; memory bars include the halo.", "shape": [16, 32], "grid": [2, 2], "cuts": [{"axis": 0, "kind": "block", "parts": 2}, {"axis": 1, "kind": "block", "parts": 2}], "map": ["t0", "t1"], "halo": 1, "bytes": 4, "kib": 48, "src": "l2"}, {"title": "Cyclic", "note": "Cut into 16 one-element pieces, then deal them round-robin: g0 = t0 mod 4. Every PE holds 4 pieces.", "shape": [16], "grid": [4], "cuts": [{"axis": 0, "kind": "block", "parts": 16}], "map": ["t0 mod 4"], "halo": 0, "bytes": 4, "kib": 48, "src": "l2"}, {"title": "Block-cyclic", "note": "Cut into 2-element blocks, then deal the blocks round-robin: g0 = t0 mod 4.", "shape": [16], "grid": [4], "cuts": [{"axis": 0, "kind": "block", "parts": 8}], "map": ["t0 mod 4"], "halo": 0, "bytes": 4, "kib": 48, "src": "l2"}, {"title": "Skew", "note": "1 \u00d7 1 pieces, g0 = (t0 + t1) mod 4: each row is the one above shifted by one PE.", "shape": [8, 8], "grid": [4], "cuts": [{"axis": 0, "kind": "block", "parts": 8}, {"axis": 1, "kind": "block", "parts": 8}], "map": ["(t0 + t1) mod 4"], "halo": 0, "bytes": 4, "kib": 48, "src": "l2"}, {"title": "Tile split", "note": "A structured 4 \u00d7 4 cut into 2 \u00d7 2 tiles, but tiles go to PEs by (t0 + 2\u00b7t1) mod 4: the cut being regular does not make the mapping regular.", "shape": [8, 8], "grid": [4], "cuts": [{"axis": 0, "kind": "block", "parts": 4}, {"axis": 1, "kind": "block", "parts": 4}], "map": ["(t0 + t1 * 2) mod 4"], "halo": 0, "bytes": 4, "kib": 48, "src": "l2"}, {"title": "Rank split k=1", "note": "8 MPI ranks, each with a 4096-element row (16 B per element: the program's 4 arrays). One rank per PE needs 64 KiB > 48 KiB. Pin it, then open 'Rank split k=4'.", "shape": [8, 4096], "grid": [8], "cuts": [{"axis": 0, "kind": "block", "parts": 8}], "map": ["t0"], "halo": 0, "bytes": 16, "kib": 48, "src": "l2"}, {"title": "Rank split k=4", "note": "refine(view, axis=1, k=4): each rank's row is cut 4 ways and the slices go to a new grid axis, owner(tx, ty). 16 KiB per PE: fits.", "shape": [8, 4096], "grid": [8, 4], "cuts": [{"axis": 0, "kind": "block", "parts": 8}, {"axis": 1, "kind": "block", "parts": 4}], "map": ["t0", "t1"], "halo": 0, "bytes": 16, "kib": 48, "src": "l2"}, {"title": "Refine 1-D", "note": "4 ranks of 16 elements, each refined 2 ways: g0 = t0 floordiv 2 (the rank), g1 = t0 mod 2 (the slice). This is rank splitting written as an affine owner map.", "shape": [64], "grid": [4, 2], "cuts": [{"axis": 0, "kind": "block", "parts": 8}], "map": ["t0 floordiv 2", "t0 mod 2"], "halo": 0, "bytes": 4, "kib": 48, "src": "l2"}, {"title": "eltwise_add", "note": "Upstream eltwise_add_with_l2, n = 2048, tile = 256: one block per herd point. The MLIR tab is the real module from air.api.", "shape": [2048], "grid": [8], "cuts": [{"axis": 0, "kind": "block", "parts": 8}], "map": ["t0"], "halo": 0, "bytes": 4, "kib": 48, "src": "l2_a", "mlir": "#map = affine_map<()[s0, s1] -> (s0 * 1024 + s1 * 256)>\nmodule {\n  func.func @eltwise_add(%arg0: memref<2048xf32>, %arg1: memref<2048xf32>, %arg2: memref<2048xf32>) {\n    %c1 = arith.constant 1 : index\n    %c1_0 = arith.constant 1 : index\n    air.launch (%arg3, %arg4) in (%arg5=%c1, %arg6=%c1_0) args(%arg7=%arg0, %arg8=%arg1, %arg9=%arg2) : memref<2048xf32>, memref<2048xf32>, memref<2048xf32> {\n      air.segment @segment_0  args(%arg10=%arg7, %arg11=%arg8, %arg12=%arg9) : memref<2048xf32>, memref<2048xf32>, memref<2048xf32> {\n        %alloc = memref.alloc() : memref<2048xf32, 1 : i32>\n        %alloc_1 = memref.alloc() : memref<2048xf32, 1 : i32>\n        %alloc_2 = memref.alloc() : memref<2048xf32, 1 : i32>\n        air.dma_memcpy_nd (%alloc[] [] [], %arg10[] [] []) : (memref<2048xf32, 1 : i32>, memref<2048xf32>)\n        air.dma_memcpy_nd (%alloc_1[] [] [], %arg11[] [] []) : (memref<2048xf32, 1 : i32>, memref<2048xf32>)\n        %c2 = arith.constant 2 : index\n        %c1_3 = arith.constant 1 : index\n        air.herd @herd_0  tile (%arg13, %arg14) in (%arg15=%c2, %arg16=%c1_3) args(%arg17=%alloc, %arg18=%alloc_1, %arg19=%alloc_2) : memref<2048xf32, 1 : i32>, memref<2048xf32, 1 : i32>, memref<2048xf32, 1 : i32> {\n          %c0 = arith.constant 0 : index\n          %c4 = arith.constant 4 : index\n          %c1_4 = arith.constant 1 : index\n          scf.for %arg20 = %c0 to %c4 step %c1_4 {\n            %alloc_5 = memref.alloc() : memref<256xf32, 2 : i32>\n            %alloc_6 = memref.alloc() : memref<256xf32, 2 : i32>\n            %alloc_7 = memref.alloc() : memref<256xf32, 2 : i32>\n            %0 = affine.apply #map()[%arg13, %arg20]\n            air.dma_memcpy_nd (%alloc_5[] [] [], %arg17[%0] [256] [1]) : (memref<256xf32, 2 : i32>, memref<2048xf32, 1 : i32>)\n            %1 = affine.apply #map()[%arg13, %arg20]\n            air.dma_memcpy_nd (%alloc_6[] [] [], %arg18[%1] [256] [1]) : (memref<256xf32, 2 : i32>, memref<2048xf32, 1 : i32>)\n            %cst = arith.constant 0.000000e+00 : f32\n            %c0_8 = arith.constant 0 : index\n            %c256 = arith.constant 256 : index\n            %c16 = arith.constant 16 : index\n            scf.for %arg21 = %c0_8 to %c256 step %c16 {\n              %3 = vector.transfer_read %alloc_5[%arg21], %cst {in_bounds = [true]} : memref<256xf32, 2 : i32>, vector<16xf32>\n              %4 = vector.transfer_read %alloc_6[%arg21], %cst {in_bounds = [true]} : memref<256xf32, 2 : i32>, vector<16xf32>\n              %5 = arith.addf %3, %4 : vector<16xf32>\n              vector.transfer_write %5, %alloc_7[%arg21] {in_bounds = [true]} : vector<16xf32>, memref<256xf32, 2 : i32>\n            }\n            memref.dealloc %alloc_6 : memref<256xf32, 2 : i32>\n            memref.dealloc %alloc_5 : memref<256xf32, 2 : i32>\n            %2 = affine.apply #map()[%arg13, %arg20]\n            air.dma_memcpy_nd (%arg19[%2] [256] [1], %alloc_7[] [] []) : (memref<2048xf32, 1 : i32>, memref<256xf32, 2 : i32>)\n            memref.dealloc %alloc_7 : memref<256xf32, 2 : i32>\n          }\n        }\n        memref.dealloc %alloc_1 : memref<2048xf32, 1 : i32>\n        memref.dealloc %alloc : memref<2048xf32, 1 : i32>\n        air.dma_memcpy_nd (%arg12[] [] [], %alloc_2[] [] []) : (memref<2048xf32>, memref<2048xf32, 1 : i32>)\n        memref.dealloc %alloc_2 : memref<2048xf32, 1 : i32>\n      }\n    }\n    return\n  }\n}\n"}], COLORS=["#3978CF", "#E59B38", "#249A82", "#A36BC6", "#D95455", "#52657B", "#2FA7C9", "#C58B1E", "#5E9E4A", "#7A5BC7", "#C2577F", "#3E8E8A", "#8C6A4A", "#4867B8", "#B8743A", "#6B7F99"];
 const $=id=>document.getElementById(id);
 let cur=null, pinned=null, tab="python";
 
-// ---------- layout algebra (port of distlayout v0) ----------
-function sizesOf(ax,extent,parts){
-  if(ax.kind==="block"){if(extent%parts)throw new Error(`axis of ${extent} is not divisible into ${parts} blocks (${extent} % ${parts} = ${extent%parts}); choose uneven`);return Array(parts).fill(extent/parts)}
-  if(ax.sizes){const s=ax.sizes.reduce((a,b)=>a+b,0);if(s!==extent||ax.sizes.length!==parts)throw new Error(`uneven sizes [${ax.sizes}] must be ${parts} parts summing to ${extent}`);return ax.sizes.slice()}
-  if((ax.policy||"balanced")==="balanced"){const q=Math.floor(extent/parts),r=extent%parts;return Array.from({length:parts},(_,k)=>k<r?q+1:q)}
+// ---------- owner-map expressions (same grammar and printing as distlayout.expr) ----------
+const E={var:k=>({t:"var",k}),con:k=>({t:"con",k}),add:(a,b)=>({t:"add",a,b}),mul:(a,k)=>({t:"mul",a,k}),fdiv:(a,k)=>({t:"fdiv",a,k}),mod:(a,k)=>({t:"mod",a,k})};
+function esub(a,b){return E.add(a,b.t==="con"?E.con(-b.k):E.mul(b,-1))}
+function emul(a,b){if(b.t==="con")return E.mul(a,b.k);if(a.t==="con")return E.mul(b,a.k);throw new Error("non-affine: multiply by a constant only")}
+function parseExpr(text){
+  const toks=[],re=/\s*(?:(\d+)|(t\d+)|(floordiv|mod|\/\/|[%*+()-]))/y;let s=text.trim(),m;re.lastIndex=0;
+  while(re.lastIndex<s.length){const p=re.lastIndex;m=re.exec(s);if(!m||re.lastIndex===p)throw new Error(`cannot parse "${text}" at "${s.slice(p)}"`);toks.push(m[1]||m[2]||m[3])}
+  let i=0;const peek=()=>toks[i],take=()=>{if(i>=toks.length)throw new Error(`unexpected end of "${text}"`);return toks[i++]};
+  function add(){let e=mul();while(peek()==="+"||peek()==="-"){const op=take(),r=mul();e=op==="+"?E.add(e,r):esub(e,r)}return e}
+  function mul(){let e=un();while(["*","floordiv","//","mod","%"].includes(peek())){const op=take(),r=un();
+    if(op==="*")e=emul(e,r);else{if(r.t!=="con"||r.k<=0)throw new Error(`${op} needs a positive constant in "${text}"`);e=(op==="floordiv"||op==="//")?E.fdiv(e,r.k):E.mod(e,r.k)}}return e}
+  function un(){if(peek()==="-"){take();return E.mul(un(),-1)}return atom()}
+  function atom(){const t=take();if(t==="("){const e=add();if(take()!==")")throw new Error(`missing ")" in "${text}"`);return e}
+    if(/^\d+$/.test(t))return E.con(+t);if(/^t\d+$/.test(t))return E.var(+t.slice(1));throw new Error(`unexpected "${t}" in "${text}"`)}
+  const e=add();if(i!==toks.length)throw new Error(`trailing input in "${text}"`);return e}
+function evalE(e,t){switch(e.t){case"var":return t[e.k];case"con":return e.k;case"add":return evalE(e.a,t)+evalE(e.b,t);
+  case"mul":return evalE(e.a,t)*e.k;case"fdiv":return Math.floor(evalE(e.a,t)/e.k);case"mod":{const v=evalE(e.a,t);return((v%e.k)+e.k)%e.k}}}
+function varsE(e){return e.t==="var"?[e.k]:e.t==="con"?[]:e.t==="add"?varsE(e.a).concat(varsE(e.b)):varsE(e.a)}
+function atomS(e){return e.t==="var"||e.t==="con"?strE(e):`(${strE(e)})`}
+function strE(e){switch(e.t){case"var":return "t"+e.k;case"con":return String(e.k);
+  case"add":{const b=e.b;if(b.t==="con"&&b.k<0)return `${strE(e.a)} - ${-b.k}`;if(b.t==="mul"&&b.k<0)return `${strE(e.a)} - ${strE(E.mul(b.a,-b.k))}`;return `${strE(e.a)} + ${strE(b)}`}
+  case"mul":return e.k===1?strE(e.a):e.k===-1?`-${atomS(e.a)}`:`${atomS(e.a)} * ${e.k}`;
+  case"fdiv":return `${atomS(e.a)} floordiv ${e.k}`;case"mod":return `${atomS(e.a)} mod ${e.k}`}}
+
+// ---------- layout algebra (port of distlayout) ----------
+function sizesOf(c,extent){const parts=c.parts;
+  if(!(parts>=1))throw new Error(`axis ${c.axis}: needs at least 1 piece`);
+  if(c.kind==="block"){if(extent%parts)throw new Error(`axis ${c.axis} of ${extent} is not divisible into ${parts} blocks (${extent} % ${parts} = ${extent%parts}); choose uneven`);return Array(parts).fill(extent/parts)}
+  if(c.sizes){const s=c.sizes.reduce((a,b)=>a+b,0);if(s!==extent||c.sizes.length!==parts)throw new Error(`uneven sizes [${c.sizes}] must be ${parts} parts summing to ${extent}`);return c.sizes.slice()}
+  if((c.policy||"balanced")==="balanced"){const q=Math.floor(extent/parts),r=extent%parts;return Array.from({length:parts},(_,k)=>k<r?q+1:q)}
   const b=Math.ceil(extent/parts);let left=extent;return Array.from({length:parts},()=>{const v=Math.min(b,left);left-=v;return v})}
+function prod(lists){return lists.reduce((acc,l)=>acc.flatMap(a=>l.map(x=>a.concat([x]))),[[]])}
 function build(spec){
   const shape=spec.shape, grid=spec.grid, rank=shape.length, G=grid.length;
   if(!rank||rank>2)throw new Error("tensor must be 1-D or 2-D");
   if(!G||G>3)throw new Error("grid must be 1-D to 3-D");
   if(shape.concat(grid).some(v=>!(v>=1)||!Number.isInteger(v)))throw new Error("shapes must be positive integers");
-  const rules=[];spec.axes.forEach((ax,a)=>{if(ax.kind!=="whole"){
-    if(!(ax.g>=0&&ax.g<G))throw new Error(`axis ${a}: grid axis g${ax.g} does not exist`);
-    if(rules.some(r=>r.g===ax.g))throw new Error(`two tensor axes placed on grid axis g${ax.g}`);
-    const sz=sizesOf(ax,shape[a],grid[ax.g]);if(sz.some(s=>s<1))throw new Error(`axis ${a}: ${grid[ax.g]} parts leave an empty part`);
-    const st=[0];sz.forEach(s=>st.push(st[st.length-1]+s));rules.push({axis:a,g:ax.g,ax,sizes:sz,starts:st})}});
-  const replicate=[...Array(G).keys()].filter(g=>!rules.some(r=>r.g===g));
-  const counts=rules.map(r=>r.sizes.length);
+  const rules=spec.cuts.map(c=>{if(!(c.axis>=0&&c.axis<rank))throw new Error(`cut on axis ${c.axis}: tensor has rank ${rank}`);
+    const sz=sizesOf(c,shape[c.axis]);if(sz.some(s=>s<1))throw new Error(`axis ${c.axis}: ${c.parts} pieces leave an empty piece`);
+    const st=[0];sz.forEach(s=>st.push(st[st.length-1]+s));return {axis:c.axis,c,sizes:sz,starts:st}});
+  const counts=rules.map(r=>r.sizes.length), ncomp=rules.length;
+  const exprs=grid.map((n,g)=>{const s=(spec.map[g]||"").trim();if(!s)return null;
+    let e;try{e=parseExpr(s)}catch(err){throw new Error(`g${g}: ${err.message}`)}
+    const bad=varsE(e).filter(k=>k>=ncomp);if(bad.length)throw new Error(`g${g} = ${strE(e)} uses t${bad[0]}, but pieces have ${ncomp} coordinate${ncomp===1?"":"s"}`);return e});
+  const replicate=[...Array(G).keys()].filter(g=>!exprs[g]);
   const pids=prod(counts.map(n=>[...Array(n).keys()]));
+  pids.forEach(pid=>exprs.forEach((e,g)=>{if(!e)return;const v=evalE(e,pid);if(!(v>=0&&v<grid[g]))throw new Error(`piece (${pid}): g${g} = ${strE(e)} = ${v}, outside grid axis of ${grid[g]} PEs`)}));
   const region=pid=>{const lo=shape.map(()=>0),hi=shape.slice();rules.forEach((r,k)=>{lo[r.axis]=r.starts[pid[k]];hi[r.axis]=r.starts[pid[k]+1]});return{lo,hi}};
   const partOf=idx=>rules.map(r=>{let p=0;while(idx[r.axis]>=r.starts[p+1])p++;return p});
   const pidIx=pid=>pid.reduce((a,p,k)=>a*counts[k]+p,0);
   const peIx=c=>c.reduce((a,v,g)=>a*grid[g]+v,0);
   const pes=prod(grid.map(n=>[...Array(n).keys()]));
-  const partAt=pe=>rules.map(r=>pe[r.g]);
+  const primaryOf=pid=>grid.map((n,g)=>exprs[g]?evalE(exprs[g],pid):0);
+  const holdersOf=pid=>{const b=primaryOf(pid);return pes.filter(pe=>pe.every((v,g)=>exprs[g]?v===b[g]:true))};
   const isPrimary=pe=>replicate.every(g=>pe[g]===0);
-  const primaryOf=pid=>{const c=grid.map(()=>0);rules.forEach((r,k)=>c[r.g]=pid[k]);return c};
-  const holdersOf=pid=>pes.filter(pe=>rules.every((r,k)=>pe[r.g]===pid[k]));
+  const at={};pes.forEach(pe=>at[peIx(pe)]=[]);pids.forEach(pid=>holdersOf(pid).forEach(h=>at[peIx(h)].push(pid)));
+  const piecesAt=pe=>at[peIx(pe)];
+  const maxPieces=Math.max(0,...Object.values(at).map(v=>v.length));
   const uniform=rules.every(r=>new Set(r.sizes).size===1);
-  return {spec,shape,grid,rules,replicate,pids,region,partOf,pidIx,peIx,pes,partAt,isPrimary,primaryOf,holdersOf,uniform};
+  // placement-shaped owner map? (each expr a distinct bare t_k, one piece per PE along it)
+  const bare=exprs.filter(Boolean);
+  const placement=bare.every(e=>e.t==="var")&&bare.map(e=>e.k).sort().join()===[...Array(ncomp).keys()].join()&&exprs.every((e,g)=>!e||counts[e.k]===grid[g]);
+  // owner-PE colors: distinct primaries in PE order
+  const prim=[...new Set(pids.map(pid=>peIx(primaryOf(pid))))].sort((a,b)=>a-b), primRank={};prim.forEach((p,i)=>primRank[p]=i);
+  return {spec,shape,grid,rules,counts,exprs,replicate,pids,region,partOf,pidIx,peIx,pes,primaryOf,holdersOf,isPrimary,piecesAt,maxPieces,uniform,placement,prim,primRank};
 }
-function colorOf(L,pi){
-  if(L.pids.length<=COLORS.length)return COLORS[pi%COLORS.length];
-  // many partitions: hue by the first split component, shade by the rest
-  const pid=L.pids[pi], rest=pid.slice(1), counts=L.rules.slice(1).map(r=>r.sizes.length);
-  const ri=rest.reduce((a,v,k)=>a*counts[k]+v,0), rn=counts.reduce((a,b)=>a*b,1);
-  return mix(COLORS[pid[0]%COLORS.length], rn>1?ri/(rn-1)*0.5:0)}
-function mix(hex,t){const n=parseInt(hex.slice(1),16),c=[n>>16,(n>>8)&255,n&255].map(v=>Math.round(v+(255-v)*t));return "#"+c.map(v=>v.toString(16).padStart(2,"0")).join("")}
-function prod(lists){return lists.reduce((acc,l)=>acc.flatMap(a=>l.map(x=>a.concat([x]))),[[]])}
 function inter(a,b){const lo=a.lo.map((v,i)=>Math.max(v,b.lo[i])),hi=a.hi.map((v,i)=>Math.min(v,b.hi[i]));return hi.every((v,i)=>v>lo[i])?{lo,hi}:null}
 function contains(a,b){return b.lo.every((v,i)=>v>=a.lo[i]&&b.hi[i]<=a.hi[i])}
 function vol(r){return r.lo.reduce((a,v,i)=>a*(r.hi[i]-v),1)}
 function rstr(r){return "["+r.lo.map((v,i)=>v+":"+r.hi[i]).join(", ")+")"}
-function plan(L,pe,h){
-  const held=L.region(L.partAt(pe));
-  const req={lo:held.lo.map(v=>Math.max(0,v-h)),hi:held.hi.map((v,i)=>Math.min(L.shape[i],v+h))};
-  const pieces=[];L.pids.forEach(pid=>{const p=inter(L.region(pid),req);if(p)pieces.push({r:p,local:contains(held,p),src:L.peIx(L.primaryOf(pid)),part:L.pidIx(pid)})});
-  return {held,req,pieces};
+function plan(L,pe,h){  // halo plan for a single-piece PE (own piece grown by h)
+  const held=L.piecesAt(pe).map(L.region);if(held.length!==1)return null;
+  const req={lo:held[0].lo.map(v=>Math.max(0,v-h)),hi:held[0].hi.map((v,i)=>Math.min(L.shape[i],v+h))};
+  const pieces=[];L.pids.forEach(pid=>{const p=inter(L.region(pid),req);if(p)pieces.push({r:p,local:held.some(m=>contains(m,p)),src:L.peIx(L.primaryOf(pid))})});
+  return {held:held[0],req,pieces};
 }
+function pname(pid){return pid.length===0?"P":pid.length===1?`P${pid[0]}`:`P(${pid.join(",")})`}
+function mix(hex,t){const n=parseInt(hex.slice(1),16),c=[n>>16,(n>>8)&255,n&255].map(v=>Math.round(v+(255-v)*t));return "#"+c.map(v=>v.toString(16).padStart(2,"0")).join("")}
+function peColor(L,ix){  // color of an owner PE
+  const r=L.primRank[ix];if(r===undefined)return "#8896A8";
+  if(L.prim.length<=COLORS.length)return COLORS[r];
+  const c=[];let k=ix;for(let g=L.grid.length-1;g>=0;g--){c.unshift(k%L.grid[g]);k=Math.floor(k/L.grid[g])}
+  const rest=c.slice(1),rc=L.grid.slice(1),ri=rest.reduce((a,v,g)=>a*rc[g]+v,0),rn=rc.reduce((a,b)=>a*b,1);
+  return mix(COLORS[c[0]%COLORS.length],rn>1?ri/(rn-1)*0.5:0)}
+function primaryIxOfPe(L,pe){return L.peIx(pe.map((v,g)=>L.replicate.includes(g)?0:v))}
 
 // ---------- text ----------
 function pyTuple(a){return a.length===1?`(${a[0]},)`:`(${a.join(", ")})`}
-function ruleRepr(r){const ax=r.ax;if(ax.kind==="block")return `Block(axis=${r.axis}, parts=${r.sizes.length})`;
-  if(ax.sizes)return `UnevenBlock(axis=${r.axis}, sizes=${pyTuple(ax.sizes)})`;
-  return `UnevenBlock(axis=${r.axis}, parts=${r.sizes.length}, policy='${ax.policy||"balanced"}')`}
+function ruleRepr(r){const c=r.c;if(c.kind==="block")return `Block(axis=${r.axis}, parts=${r.sizes.length})`;
+  if(c.sizes)return `UnevenBlock(axis=${r.axis}, sizes=${pyTuple(c.sizes)})`;
+  return `UnevenBlock(axis=${r.axis}, parts=${r.sizes.length}, policy='${c.policy||"balanced"}')`}
 function gridRepr(g){return g.length>1?`Grid(${pyTuple(g)})`:`Grid(${g[0]})`}
-function pyText(L){
-  const rules=L.rules.map(ruleRepr).join(", ");
-  let m;if(!L.rules.length)m=`Replicate(${gridRepr(L.grid)})`;
-  else{const place="{"+L.rules.map((r,k)=>`${k}: ${r.g}`).join(", ")+"}";m=`Map(${gridRepr(L.grid)}, ${place}${L.replicate.length?`, replicate=[${L.replicate.join(", ")}]`:""})`}
-  return `view = bind(${L.spec.src||"l2"}, Decomposition(${rules}), ${m})`}
+function mappingRepr(L){
+  const rep=L.replicate.length?`, replicate=[${L.replicate.join(", ")}]`:"";
+  if(L.placement){if(!L.rules.length&&L.replicate.length===L.grid.length)return `Replicate(${gridRepr(L.grid)})`;
+    const pl=L.exprs.map((e,g)=>e?[e.k,g]:null).filter(Boolean).sort((a,b)=>a[0]-b[0]);
+    return `Map(${gridRepr(L.grid)}, {${pl.map(([k,g])=>`${k}: ${g}`).join(", ")}}${rep})`}
+  return `OwnerMap(${gridRepr(L.grid)}, {${L.exprs.map((e,g)=>e?`${g}: '${strE(e)}'`:null).filter(Boolean).join(", ")}}${rep})`}
+function pyText(L){return `view = bind(${L.spec.src||"l2"}, Decomposition(${L.rules.map(ruleRepr).join(", ")}), ${mappingRepr(L)})`}
 function attrText(L){
-  const rr=L.rules.map(r=>r.ax.kind==="block"?`block<axis = ${r.axis}, parts = ${r.sizes.length}>`:
-    r.ax.sizes?`uneven<axis = ${r.axis}, sizes = [${r.ax.sizes.join(", ")}]>`:`uneven<axis = ${r.axis}, parts = ${r.sizes.length}, policy = ${r.ax.policy||"balanced"}>`).join(", ");
-  return `#dist.layout<shape = [${L.shape.join(", ")}], grid = [${L.grid.join(", ")}], decomp = [${rr}], place = [${L.rules.map((r,k)=>`${k} -> g${r.g}`).join(", ")}], replicate = [${L.replicate.map(g=>"g"+g).join(", ")}]>`}
+  const rr=L.rules.map(r=>r.c.kind==="block"?`block<axis = ${r.axis}, parts = ${r.sizes.length}>`:
+    r.c.sizes?`uneven<axis = ${r.axis}, sizes = [${r.c.sizes.join(", ")}]>`:`uneven<axis = ${r.axis}, parts = ${r.sizes.length}, policy = ${r.c.policy||"balanced"}>`).join(", ");
+  const head=`#dist.layout<shape = [${L.shape.join(", ")}], grid = [${L.grid.join(", ")}], decomp = [${rr}], `, rep=`replicate = [${L.replicate.map(g=>"g"+g).join(", ")}]>`;
+  if(L.placement){const pl=L.exprs.map((e,g)=>e?[e.k,g]:null).filter(Boolean).sort((a,b)=>a[0]-b[0]);return head+`place = [${pl.map(([k,g])=>`${k} -> g${g}`).join(", ")}], `+rep}
+  return head+`owner = [${L.exprs.map((e,g)=>e?`g${g} = ${strE(e)}`:null).filter(Boolean).join(", ")}], `+rep}
 function airText(L){
+  if(!L.placement)return "# owner map: PEs can hold several pieces; the AIR backend emits\n# placement maps only (AIR work is on hold).";
   if(!L.uniform)return "# uneven layout: PEs hold different sizes, and air.api needs one static\n# transfer size, so the AIR backend does not emit this layout yet.";
-  const names=["tx","ty","tz"].slice(0,L.grid.length), src=L.spec.src||"l2";
-  const sub=L.shape.map((n,a)=>{const r=L.rules.find(r=>r.axis===a);if(!r)return `0 : ${n}`;const b=r.sizes[0],c=names[r.g];return `${c}*${b} : ${c}*${b} + ${b}`}).join(", ");
-  const herd=L.grid.map((n,g)=>{const r=L.rules.find(r=>r.g===g);return r?`range(0, ${L.shape[r.axis]}, ${r.sizes[0]})`:`range(${n})`}).join(", ");
+  const names=["tx","ty","tz"].slice(0,L.grid.length), src=L.spec.src||"l2", gOf=k=>L.exprs.findIndex(e=>e&&e.k===k);
+  const sub=L.shape.map((n,a)=>{const k=L.rules.findIndex(r=>r.axis===a);if(k<0)return `0 : ${n}`;const b=L.rules[k].sizes[0],c=names[gOf(k)];return `${c}*${b} : ${c}*${b} + ${b}`}).join(", ");
+  const herd=L.grid.map((n,g)=>{const e=L.exprs[g];if(!e)return `range(${n})`;const r=L.rules[e.k];return `range(0, ${L.shape[r.axis]}, ${r.sizes[0]})`}).join(", ");
   const loc=L.shape.map((n,a)=>{const r=L.rules.find(r=>r.axis===a);return r?r.sizes[0]:n});
-  const rep=L.replicate.map(g=>names[g]);
+  const rep=L.replicate.filter(g=>L.grid[g]>1).map(g=>names[g]);
   return `with air.herd([${herd}]) as h:\n  @h.body\n  def _(${names.join(", ")}):\n    a = air.alloc([${loc.join(", ")}], f32, scope=h.private())\n    air.ops.load(a, ${src}[${sub}])`+
     (rep.length?`\n    # ${rep.join(", ")} not in the offset: every PE along it reads the same region (broadcast)`:"")+
     `\n\n# with distlayout:\n#   a = air_backend.alloc_local(view, f32, scope=h.private())\n#   air_backend.load_local(view, a, (${names.join(", ")}${names.length===1?",":""}))`}
 function formula(L,idx){
   const pid=L.partOf(idx);
-  const parts=L.rules.map((r,k)=>r.ax.kind==="block"?`p${k} = i${r.axis} // ${r.sizes[0]} = ${pid[k]}`:
-    `p${k} = part holding i${r.axis} in [${r.sizes.join(", ")}] = ${pid[k]}`);
-  const pe=L.primaryOf(pid), hs=L.holdersOf(pid).map(L.peIx);
-  return `element (${idx.join(", ")}): ${parts.join(";  ")||"one piece"}  →  piece ${pname(pid)}  →  PE ${L.peIx(pe)} (${pe.join(", ")})`+(hs.length>1?`, held by ${hs.length} PEs`:"");
+  const cut=L.rules.map((r,k)=>r.c.kind==="block"?`t${k} = i${r.axis} // ${r.sizes[0]} = ${pid[k]}`:`t${k} = piece of i${r.axis} in [${r.sizes.join(", ")}] = ${pid[k]}`);
+  const map=L.exprs.map((e,g)=>e?`g${g} = ${strE(e)} = ${evalE(e,pid)}`:null).filter(Boolean);
+  const pe=L.primaryOf(pid), hs=L.holdersOf(pid);
+  return `element (${idx.join(", ")}): ${cut.join("; ")||"one piece"} → ${pname(pid)} → ${map.join("; ")||"(replicated)"} → PE ${L.peIx(pe)}`+(hs.length>1?`, held by ${hs.length} PEs`:"");
 }
+function hint(L){
+  const cut=L.rules.map((r,k)=>r.c.kind==="block"?`t${k} = i${r.axis} // ${r.sizes[0]}`:`t${k} from sizes [${r.sizes.join(", ")}]`).join(", ");
+  const map=L.exprs.map((e,g)=>e?`g${g} = ${strE(e)}`:null).filter(Boolean).join(", ");
+  const rr=L.replicate.filter(g=>L.grid[g]>1);
+  return `hover an element · cut: ${cut||"none"} · map: ${map||"none"}`+(rr.length?` · replicated over ${rr.map(g=>"g"+g).join(", ")}`:"");
+}
+function fmtB(b){return b>=1024?(b/1024).toFixed(b%1024?1:0)+" KiB":b+" B"}
 
 // ---------- drawing (SVG) ----------
-function pname(pid){return pid.length===0?"P":pid.length===1?`P${pid[0]}`:`P(${pid.join(",")})`}
 function draw(L){
-  const W=Math.min(860,$("pic").clientWidth||860), h=+L.spec.halo||0, bytes=+L.spec.bytes||4, budget=(+L.spec.kib||48)*1024;
+  const W=Math.min(880,$("pic").clientWidth||880), h=+L.spec.halo||0, bytes=+L.spec.bytes||4, budget=(+L.spec.kib||48)*1024;
   const rank=L.shape.length, ink="var(--ink)", muted="var(--muted)";
   const cap=(x,y,t)=>`<text x="${x}" y="${y}" font-size="12" font-weight="600" fill="${ink}">${t}</text>`;
   const sub=(x,y,t)=>`<text x="${x}" y="${y}" font-size="11.5" fill="${muted}">${t}</text>`;
   let s="";
-  // ① decomposition template: the cutter, no PEs yet
-  const TW=Math.max(150,Math.min(220,Math.floor(W*0.26))), ty0=30;
-  let tw0,th0;
-  let toScale=true;
+  // ① the cutter
+  const TW=Math.max(150,Math.min(220,Math.floor(W*0.25))), ty0=30;
+  let tw0,th0,toScale=true;
   if(rank===1){tw0=TW;th0=34}else{const sc0=Math.min(TW/L.shape[1],150/L.shape[0]);tw0=L.shape[1]*sc0;th0=L.shape[0]*sc0;
     if(tw0<TW*0.3||th0<44){toScale=false;tw0=Math.max(tw0,TW*0.45);th0=Math.max(th0,Math.min(150,18*Math.max(2,...L.rules.filter(r=>r.axis===0).map(r=>r.sizes.length))))}}
   const fx=v=>v/(rank===1?L.shape[0]:L.shape[1])*tw0, fy=v=>rank===1?0:v/L.shape[0]*th0;
-  s+=cap(0,14,"① Decompose")+`<rect x="0.5" y="${ty0+.5}" width="${tw0}" height="${th0}" fill="var(--bg)" stroke="${ink}" stroke-width="1.2" rx="3"/>`;
-  L.rules.forEach(r=>{r.starts.slice(1,-1).forEach(v=>{
-    if(rank===1||r.axis===1){const x=fx(v)+.5;s+=`<line x1="${x}" y1="${ty0}" x2="${x}" y2="${ty0+th0}" stroke="${ink}" stroke-width="1.4" stroke-dasharray="5 3"/>`}
-    else{const y=ty0+fy(v)+.5;s+=`<line x1="0" y1="${y}" x2="${tw0}" y2="${y}" stroke="${ink}" stroke-width="1.4" stroke-dasharray="5 3"/>`}})});
+  s+=cap(0,14,"① Cut")+`<rect x="0.5" y="${ty0+.5}" width="${tw0}" height="${th0}" fill="var(--bg)" stroke="${ink}" stroke-width="1.2" rx="3"/>`;
+  L.rules.forEach(r=>{const dense=r.sizes.length>48;r.starts.slice(1,-1).forEach(v=>{
+    if(rank===1||r.axis===1){const x=fx(v)+.5;s+=`<line x1="${x}" y1="${ty0}" x2="${x}" y2="${ty0+th0}" stroke="${ink}" stroke-width="${dense?.6:1.4}" stroke-dasharray="${dense?"2 2":"5 3"}"/>`}
+    else{const y=ty0+fy(v)+.5;s+=`<line x1="0" y1="${y}" x2="${tw0}" y2="${y}" stroke="${ink}" stroke-width="${dense?.6:1.4}" stroke-dasharray="${dense?"2 2":"5 3"}"/>`}})});
   L.pids.forEach(pid=>{const r=L.region(pid);const x1=fx(rank===1?r.lo[0]:r.lo[1]),x2=fx(rank===1?r.hi[0]:r.hi[1]),y1=rank===1?0:fy(r.lo[0]),y2=rank===1?th0:fy(r.hi[0]);
     const lab=pname(pid);if(x2-x1>=lab.length*6.5&&y2-y1>=14)s+=`<text x="${(x1+x2)/2}" y="${ty0+(y1+y2)/2+4}" font-size="11" fill="${muted}" text-anchor="middle">${lab}</text>`});
-  const rulesTxt=L.rules.length?L.rules.map(r=>ruleRepr(r)):["Decomposition(): one piece"];
+  const rulesTxt=L.rules.length?L.rules.map((r,k)=>`t${k}: ${ruleRepr(r)}`):["no cut: one piece"];
   if(!toScale)rulesTxt.push("(not to scale)");
   rulesTxt.forEach((t,k)=>s+=sub(0,ty0+th0+18+k*15,t));
   const tBottom=ty0+th0+18+(rulesTxt.length-1)*15;
-  // ② the tensor, cut by the same structure
+  // ② the tensor: same cuts, colored by the owner PE of each piece
   const X0=TW+46, AW=W-X0;
   let rows,cols,at0;
-  if(rank===1){const n=L.shape[0],b=L.rules.length?Math.max(...L.rules[0].sizes):n;const w=b<=64?b:64;cols=Math.min(n,w);rows=Math.ceil(n/cols);at0=(r,c)=>r*cols+c<n?[r*cols+c]:null}
+  if(rank===1){const n=L.shape[0],b=L.rules.length?Math.max(...L.rules[0].sizes):n;const w=(b>=4&&b<=64)?b:b>64?64:Math.min(n,32);cols=Math.min(n,w);rows=Math.ceil(n/cols);at0=(r,c)=>r*cols+c<n?[r*cols+c]:null}
   else{rows=L.shape[0];cols=L.shape[1];at0=(r,c)=>[r,c]}
-  const sr=Math.ceil(rows/48), sc=Math.ceil(cols/64), at=(r,c)=>at0(r*sr,c*sc);   // sample big tensors
+  const sr=Math.ceil(rows/48), sc=Math.ceil(cols/64), at=(r,c)=>at0(r*sr,c*sc);
   rows=Math.ceil(rows/sr);cols=Math.ceil(cols/sc);
   const cs=Math.max(4,Math.min(26,Math.floor(AW/cols)-2)), gap=cs>8?2:1, step=cs+gap, tw=cols*step, th=rows*step;
   s+=`<path d="M${TW+10},${ty0+th0/2} h22" stroke="${muted}" stroke-width="1.5" marker-end="url(#ahm)"/>`;
-  s+=cap(X0,14,`② Cut the tensor ${L.shape.join(" × ")}`)+sub(X0+190,14,sr>1||sc>1?`showing every ${rank===1?sr*sc:[sr,sc].join(" × ")}th element`:"");
+  s+=cap(X0,14,`② Tensor ${L.shape.join(" × ")}, colored by owner PE`)+sub(X0+300,14,sr>1||sc>1?`showing every ${rank===1?sr*sc:[sr,sc].join(" × ")}th element`:"");
   const y0=ty0, pidAt=[], box={};
   for(let r=0;r<rows;r++){pidAt.push([]);for(let c=0;c<cols;c++){const idx=at(r,c);if(!idx){pidAt[r].push(-1);continue}
-    const pi=L.pidIx(L.partOf(idx));pidAt[r].push(pi);
+    const pid=L.partOf(idx),pi=L.pidIx(pid),own=L.peIx(L.primaryOf(pid));pidAt[r].push(pi);
     const x=X0+c*step,y=y0+r*step;const bb=box[pi]=box[pi]||[x,y,x,y];bb[0]=Math.min(bb[0],x);bb[1]=Math.min(bb[1],y);bb[2]=Math.max(bb[2],x+cs);bb[3]=Math.max(bb[3],y+cs);
-    s+=`<rect class="el" data-i="${idx}" data-p="${pi}" x="${x}" y="${y}" width="${cs}" height="${cs}" rx="${cs>10?3:1}" fill="${colorOf(L,pi)}"/>`}}
-  // dashed cuts wherever neighboring cells belong to different pieces
+    s+=`<rect class="el" data-i="${idx}" data-o="${own}" x="${x}" y="${y}" width="${cs}" height="${cs}" rx="${cs>10?3:1}" fill="${peColor(L,own)}"/>`}}
   let cuts="";
   for(let r=0;r<rows;r++)for(let c=0;c<cols;c++){const p0=pidAt[r][c];if(p0<0)continue;
     if(c+1<cols&&pidAt[r][c+1]>=0&&pidAt[r][c+1]!==p0){const x=X0+(c+1)*step-gap/2;cuts+=`M${x},${y0+r*step-gap/2}v${step}`}
     if(r+1<rows&&pidAt[r+1][c]>=0&&pidAt[r+1][c]!==p0){const y=y0+(r+1)*step-gap/2;cuts+=`M${X0+c*step-gap/2},${y}h${step}`}}
-  s+=`<path d="${cuts}" fill="none" stroke="${ink}" stroke-width="1.6" stroke-dasharray="5 3" pointer-events="none"/>`;
+  if(cs>=8)s+=`<path d="${cuts}" fill="none" stroke="${ink}" stroke-width="1.4" stroke-dasharray="5 3" pointer-events="none"/>`;
   Object.entries(box).forEach(([pi,[x1,y1,x2,y2]])=>{const lab=pname(L.pids[+pi]),lw=lab.length*7+10;if(x2-x1>=lw+4&&y2-y1>=16){
     const cx=(x1+x2)/2,cy=(y1+y2)/2;
     s+=`<g pointer-events="none"><rect x="${cx-lw/2}" y="${cy-9}" width="${lw}" height="18" rx="9" fill="rgba(23,37,60,.78)"/><text x="${cx}" y="${cy+4}" font-size="11.5" font-weight="700" fill="#fff" text-anchor="middle">${lab}</text></g>`}});
   // ③ PE grid
-  const G=L.grid, gr=G.length>1?G.slice(0,-1).reduce((a,b)=>a*b,1):1, gc=G[G.length-1];
-  const bw=Math.max(96,Math.min(150,Math.floor((W-8)/gc)-12)), bh=58, bg=h?34:12, py=Math.max(y0+th,tBottom)+48;
-  s+=cap(0,py-14,`③ Map pieces to PEs: grid ${G.join(" × ")}`)+sub(230,py-14,`region held, memory used${h?` (with halo ${h})`:""}${realRep(L).length?`; replicated over ${realRep(L).map(g=>"g"+g).join(", ")}`:""}`);
+  const G=L.grid, gr=G.length>1?G.slice(0,-1).reduce((a,b)=>a*b,1):1, gc=G[G.length-1], halo=h&&L.maxPieces<=1;
+  const bw=Math.max(104,Math.min(160,Math.floor((W-8)/gc)-12)), bh=58, bg=halo?34:12, py=Math.max(y0+th,tBottom)+48;
+  const rr=L.replicate.filter(g=>L.grid[g]>1);
+  s+=cap(0,py-14,`③ Map: grid ${G.join(" × ")}`)+sub(150,py-14,`pieces held, memory used${halo?` (with halo ${h})`:h?" (halo shown for one-piece PEs only)":""}${rr.length?`; replicated over ${rr.map(g=>"g"+g).join(", ")}`:""}`);
   const pos={};let maxB=0,over=0;
   L.pes.forEach(pe=>{const i=L.peIx(pe),row=G.length>1?Math.floor(i/gc):0,col=i%gc,x=col*(bw+bg),y=py+row*(bh+bg);pos[i]=[x+bw/2,y+bh/2];
-    const pid=L.partAt(pe),pi=L.pidIx(pid),pl=plan(L,pe,h),b=vol(pl.req)*bytes;maxB=Math.max(maxB,b);if(b>budget)over++;
-    const frac=Math.min(1,b/budget),col2=colorOf(L,pi);
-    s+=`<g class="pe" data-p="${pi}" data-pe="${i}"><rect x="${x}" y="${y}" width="${bw}" height="${bh}" rx="7" fill="${col2}" ${L.isPrimary(pe)?"":`fill-opacity=".55"`}/>`+
-      `<text x="${x+8}" y="${y+16}" font-size="12" font-weight="700" fill="#fff">PE ${i} ← ${pname(pid)}${L.isPrimary(pe)?"":" · replica"}</text>`+
-      `<text x="${x+8}" y="${y+31}" font-size="11" fill="#fff">${rstr(pl.held)}</text>`+
+    const ps=L.piecesAt(pe),pl=halo?plan(L,pe,h):null,b=(pl?vol(pl.req):ps.reduce((a,p)=>a+vol(L.region(p)),0))*bytes;maxB=Math.max(maxB,b);if(b>budget)over++;
+    const frac=Math.min(1,b/budget),own=primaryIxOfPe(L,pe),col2=ps.length?peColor(L,own):"#B9C4D2";
+    const label=ps.length===0?"empty":ps.length===1?pname(ps[0]):ps.length<=3?ps.map(pname).join(" "):`${ps.length} pieces`;
+    const regs=ps.length===0?"—":ps.length===1?rstr(L.region(ps[0])):ps.slice(0,2).map(p=>rstr(L.region(p))).join(" ")+(ps.length>2?" …":"");
+    s+=`<g class="pe" data-o="${own}" data-pe="${i}"><rect x="${x}" y="${y}" width="${bw}" height="${bh}" rx="7" fill="${col2}" ${L.isPrimary(pe)?"":`fill-opacity=".55"`}/>`+
+      `<text x="${x+8}" y="${y+16}" font-size="12" font-weight="700" fill="#fff">PE ${i} ← ${label}${L.isPrimary(pe)?"":" · replica"}</text>`+
+      `<text x="${x+8}" y="${y+31}" font-size="10.5" fill="#fff">${regs}</text>`+
       `<rect x="${x+8}" y="${y+40}" width="${bw-52}" height="8" rx="3" fill="rgba(255,255,255,.35)"/>`+
       `<rect x="${x+8}" y="${y+40}" width="${(bw-52)*frac}" height="8" rx="3" fill="${b>budget?"#17253C":"#fff"}"/>`+
       `<text x="${x+bw-8}" y="${y+48}" font-size="10" font-weight="${b>budget?700:400}" fill="#fff" text-anchor="end">${b>budget?"✕ ":""}${fmtB(b)}</text>`+
-      `<title>PE ${i} (${pe}) holds piece ${pname(pid)} = ${rstr(pl.held)}${h?`, needs ${rstr(pl.req)}`:""}: ${fmtB(b)} of ${fmtB(budget)}</title></g>`});
-  // import arrows (halo)
+      `<title>PE ${i} (${pe}) holds ${ps.map(p=>pname(p)+" "+rstr(L.region(p))).join(", ")||"nothing"}${pl?`, needs ${rstr(pl.req)}`:""}: ${fmtB(b)} of ${fmtB(budget)}</title></g>`});
   let arrows="";const pair={};
-  if(h)L.pes.forEach(pe=>{const dst=L.peIx(pe);plan(L,pe,h).pieces.filter(p=>!p.local).forEach(p=>{const a=Math.min(p.src,dst),b=Math.max(p.src,dst),k=a+"-"+b;
+  if(halo)L.pes.forEach(pe=>{const dst=L.peIx(pe),pl=plan(L,pe,h);if(!pl)return;pl.pieces.filter(p=>!p.local).forEach(p=>{const a=Math.min(p.src,dst),b=Math.max(p.src,dst),k=a+"-"+b;
     pair[k]=pair[k]||{a,b,n:0,dirs:new Set()};pair[k].n+=vol(p.r);pair[k].dirs.add(p.src===a?"ab":"ba")})});
   const edge=(x,y,dx,dy)=>{const t=Math.min(Math.abs(dx)>1e-9?(bw/2+4)/Math.abs(dx):1e9,Math.abs(dy)>1e-9?(bh/2+4)/Math.abs(dy):1e9);return [x+dx*t,y+dy*t]};
   Object.values(pair).forEach(({a,b,n,dirs})=>{const [x1,y1]=pos[a],[x2,y2]=pos[b],dx=x2-x1,dy=y2-y1;
     const [sx,sy]=edge(x1,y1,dx,dy),[ex,ey]=edge(x2,y2,-dx,-dy),diag=Math.abs(dx)>1&&Math.abs(dy)>1;
     arrows+=`<line x1="${sx}" y1="${sy}" x2="${ex}" y2="${ey}" stroke="#D95455" stroke-width="${diag?1.2:2.2}" ${diag?'stroke-dasharray="4 3"':""} ${dirs.has("ab")?'marker-end="url(#ah)"':""} ${dirs.has("ba")?'marker-start="url(#ah2)"':""}><title>PE ${a} ⇄ PE ${b}: ${n} halo elements</title></line>`});
-  const ph=(gr)*(bh+bg), H=py+ph+4, PW=Math.max(X0+tw,gc*(bw+bg),TW);
-  const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="${PW}" height="${H}" viewBox="0 0 ${PW} ${H}"><defs><marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0L10,5L0,10z" fill="#D95455"/></marker><marker id="ahm" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#52657B"/></marker><marker id="ah2" viewBox="0 0 10 10" refX="2" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M10,0L0,5L10,10z" fill="#D95455"/></marker></defs>${s}${arrows}</svg>`;
-  $("pic").innerHTML=`<div style="overflow-x:auto">${svg}</div>`;
+  const H=py+gr*(bh+bg)+4, PW=Math.max(X0+tw,gc*(bw+bg),TW);
+  const mk=(id,d,rx)=>`<marker id="${id}" viewBox="0 0 10 10" refX="${rx}" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="${d}" fill="${id==="ahm"?"#52657B":"#D95455"}"/></marker>`;
+  $("pic").innerHTML=`<div style="overflow-x:auto"><svg xmlns="http://www.w3.org/2000/svg" width="${PW}" height="${H}" viewBox="0 0 ${PW} ${H}"><defs>${mk("ah","M0,0L10,5L0,10z",8)}${mk("ah2","M10,0L0,5L10,10z",2)}${mk("ahm","M0,0L10,5L0,10z",8)}</defs>${s}${arrows}</svg></div>`;
   // legend & stats
-  $("legend").innerHTML=L.pids.slice(0,12).map(pid=>{const pi=L.pidIx(pid),hs=L.holdersOf(pid).length;return `<span><i class="sw" style="background:${colorOf(L,pi)}"></i>${pname(pid)} ${rstr(L.region(pid))} → PE ${L.peIx(L.primaryOf(pid))}${hs>1?` +${hs-1} replica${hs>2?"s":""}`:""}</span>`}).join("")+(L.pids.length>12?`<span>… ${L.pids.length-12} more</span>`:"")+(h?`<span><i class="sw" style="background:#D95455"></i>halo import</span>`:"");
+  const byOwner={};L.pids.forEach(pid=>{const o=L.peIx(L.primaryOf(pid));(byOwner[o]=byOwner[o]||[]).push(pid)});
+  $("legend").innerHTML=L.prim.slice(0,12).map(o=>{const ps=byOwner[o],hs=L.holdersOf(ps[0]).length;
+    return `<span><i class="sw" style="background:${peColor(L,o)}"></i>PE ${o} ← ${ps.length<=3?ps.map(pname).join(", "):ps.length+" pieces"}${hs>1?` +${hs-1} replica${hs>2?"s":""}`:""}</span>`}).join("")+(L.prim.length>12?`<span>… ${L.prim.length-12} more</span>`:"")+(halo?`<span><i class="sw" style="background:#D95455"></i>halo import</span>`:"");
   L.maxB=maxB;
   const fit=over?`<b style="color:var(--comm)">${over} PE${over>1?"s":""} over budget</b>`:`<b style="color:var(--ok)">fits</b>`;
   $("stat").innerHTML=`max ${fmtB(maxB)} / PE of ${fmtB(budget)} · ${fit}`+(pinned?` · vs A (${pinned.name}): ${fmtB(pinned.maxB)} / PE → ${maxB<=pinned.maxB?(pinned.maxB/maxB).toFixed(2)+"× less":(maxB/pinned.maxB).toFixed(2)+"× more"}`:"");
-  // hover
   const svgEl=$("pic").querySelector("svg");
-  svgEl.querySelectorAll(".el").forEach(e=>{e.onmouseenter=()=>{hl(+e.dataset.p);$("formula").textContent=formula(L,e.dataset.i.split(",").map(Number))};e.onmouseleave=unhl});
-  svgEl.querySelectorAll(".pe").forEach(e=>{e.onmouseenter=()=>hl(+e.dataset.p);e.onmouseleave=unhl});
-  function hl(p){svgEl.querySelectorAll(".el,.pe").forEach(e=>e.style.opacity=+e.dataset.p===p?1:.2)}
+  svgEl.querySelectorAll(".el").forEach(e=>{e.onmouseenter=()=>{hl(+e.dataset.o);$("formula").textContent=formula(L,e.dataset.i.split(",").map(Number))};e.onmouseleave=unhl});
+  svgEl.querySelectorAll(".pe").forEach(e=>{e.onmouseenter=()=>hl(+e.dataset.o);e.onmouseleave=unhl});
+  function hl(o){svgEl.querySelectorAll(".el,.pe").forEach(e=>e.style.opacity=+e.dataset.o===o?1:.2)}
   function unhl(){svgEl.querySelectorAll(".el,.pe").forEach(e=>e.style.opacity="");$("formula").textContent=hint(L)}
   $("formula").textContent=hint(L);
 }
-function hint(L){return L.rules.length?"hover an element for its owner formula; "+L.rules.map((r,k)=>r.ax.kind==="block"?`p${k} = i${r.axis} // ${r.sizes[0]}`:`p${k} from sizes [${r.sizes.join(", ")}]`).join(", ")+(realRep(L).length?`; replicated over ${realRep(L).map(g=>"g"+g).join(", ")}`:""):"every PE holds the whole tensor; owner is PE 0"}
-function realRep(L){return L.replicate.filter(g=>L.grid[g]>1)}
-function fmtB(b){return b>=1024?(b/1024).toFixed(b%1024?1:0)+" KiB":b+" B"}
 
 // ---------- UI ----------
 function parseList(v){return v.split(/[x×,\s]+/).filter(Boolean).map(Number)}
-function axisOptions(G){const o=[["whole","whole (not split)"]];for(let g=0;g<G;g++){o.push([`block:${g}`,`block → g${g}`]);o.push([`uneven:${g}`,`uneven → g${g}`])}return o}
-function syncAxes(spec){
-  const G=spec.grid.length, box=$("axes");box.innerHTML="";
-  spec.shape.forEach((n,a)=>{const ax=spec.axes[a]||{kind:"whole"},v=ax.kind==="whole"?"whole":`${ax.kind}:${ax.g}`;
-    box.insertAdjacentHTML("beforeend",`<label>Tensor axis ${a} (${n})</label><select data-a="${a}">${axisOptions(G).map(([k,t])=>`<option value="${k}" ${k===v?"selected":""}>${t}</option>`).join("")}</select>`)});
-  box.querySelectorAll("select").forEach(s=>s.onchange=()=>{const [k,g]=s.value.split(":");cur.axes[+s.dataset.a]=k==="whole"?{kind:"whole"}:{kind:k,g:+g,policy:"balanced"};render()});
+function syncForm(){
+  const box=$("cuts");box.innerHTML="";
+  cur.shape.forEach((n,a)=>{const c=cur.cuts.find(c=>c.axis===a),kind=c?c.kind:"whole";
+    box.insertAdjacentHTML("beforeend",`<div class="row3"><div><label>Tensor axis ${a} (${n})</label><select data-a="${a}">${["whole","block","uneven"].map(k=>`<option ${k===kind?"selected":""}>${k}</option>`).join("")}</select></div>`+
+      `<div><label>pieces</label><input type="number" min="1" data-p="${a}" value="${c?c.parts:1}" ${c?"":"disabled"}></div></div>`)});
+  box.querySelectorAll("select").forEach(sel=>sel.onchange=()=>{const a=+sel.dataset.a,k=sel.value;cur.cuts=cur.cuts.filter(c=>c.axis!==a);
+    if(k!=="whole"){const ncut=cur.cuts.length;cur.cuts.push({axis:a,kind:k,parts:cur.grid[Math.min(ncut,cur.grid.length-1)]||2,policy:"balanced"});cur.cuts.sort((x,y)=>x.axis-y.axis);
+      const k2=cur.cuts.findIndex(c=>c.axis===a),g=Math.min(k2,cur.grid.length-1);if(!(cur.map[g]||"").trim())cur.map[g]="t"+k2}
+    delete cur.mlir;syncForm();render()});
+  box.querySelectorAll("input").forEach(inp=>inp.oninput=()=>{const c=cur.cuts.find(c=>c.axis===+inp.dataset.p);if(c){c.parts=+inp.value;delete c.sizes;delete cur.mlir;render()}});
+  const mb=$("maps");mb.innerHTML="";
+  cur.grid.forEach((n,g)=>mb.insertAdjacentHTML("beforeend",`<label>Grid axis g${g} (${n} PEs)</label><input class="mono" data-g="${g}" value="${(cur.map[g]||"").replace(/"/g,"&quot;")}" placeholder="replicated">`));
+  mb.querySelectorAll("input").forEach(inp=>inp.oninput=()=>{cur.map[+inp.dataset.g]=inp.value;delete cur.mlir;render()});
 }
 function load(spec){cur=JSON.parse(JSON.stringify(spec));$("shape").value=cur.shape.join(" × ");$("grid").value=cur.grid.join(" × ");
-  $("halo").value=cur.halo||0;$("bytes").value=cur.bytes||4;$("kib").value=cur.kib||48;$("note").textContent=cur.note||"";syncAxes(cur);render()}
+  $("halo").value=cur.halo||0;$("bytes").value=cur.bytes||4;$("kib").value=cur.kib||48;$("note").textContent=cur.note||"";syncForm();render()}
 function render(){
   try{const L=build(cur);$("err").textContent="";draw(L);showCode(L);window.__last=L}
   catch(e){$("err").textContent=e.message}}
@@ -253,20 +311,18 @@ function showCode(L){
   const t={python:["Python",pyText(L)],attr:["#dist.layout",attrText(L)],air:["air.api",airText(L)],mlir:["MLIR",cur.mlir||"# MLIR is embedded when the page is rendered with MLIR-AIR installed\n# (python3 examples/gallery.py). Editing the layout drops it."]};
   $("tabs").innerHTML=Object.entries(t).map(([k,[n]])=>`<button data-t="${k}" class="${k===tab?"on":""}">${n}</button>`).join("");
   $("tabs").querySelectorAll("button").forEach(b=>b.onclick=()=>{tab=b.dataset.t;showCode(L)});$("code").textContent=t[tab][1]}
-["shape","grid"].forEach(id=>$(id).onchange=()=>{const v=parseList($(id).value);cur[id]=v;delete cur.mlir;
-  if(id==="shape")cur.axes=v.map((_,a)=>cur.axes[a]||{kind:"whole"});
-  cur.axes=cur.axes.map(ax=>ax.kind!=="whole"&&ax.g>=cur.grid.length?{kind:"whole"}:ax).map(ax=>{const c=Object.assign({},ax);delete c.sizes;return c});
-  syncAxes(cur);render()});
+$("shape").onchange=()=>{cur.shape=parseList($("shape").value);cur.cuts=cur.cuts.filter(c=>c.axis<cur.shape.length).map(c=>{const d=Object.assign({},c);delete d.sizes;return d});delete cur.mlir;syncForm();render()};
+$("grid").onchange=()=>{cur.grid=parseList($("grid").value);cur.map=cur.grid.map((_,g)=>cur.map[g]||"");delete cur.mlir;syncForm();render()};
 ["halo","bytes","kib"].forEach(id=>$(id).oninput=()=>{cur[id]=+$(id).value;render()});
 $("pin").onclick=()=>{if(window.__last){pinned={name:`${cur.title||"layout"} on ${cur.grid.join("×")}`,maxB:window.__last.maxB};render()}};
 $("svg").onclick=()=>{const s=$("pic").querySelector("svg");if(!s)return;const css=getComputedStyle(document.documentElement);
   const v=(n,d)=>css.getPropertyValue(n).trim()||d;
-  let txt=new XMLSerializer().serializeToString(s).replace(/var\(--muted\)/g,v("--muted","#52657B")).replace(/var\(--ink\)/g,v("--ink","#17253C")).replace(/var\(--bg\)/g,v("--bg","#FFFFFF"));
+  const txt=new XMLSerializer().serializeToString(s).replace(/var\(--muted\)/g,v("--muted","#52657B")).replace(/var\(--ink\)/g,v("--ink","#17253C")).replace(/var\(--bg\)/g,v("--bg","#FFFFFF"));
   const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([txt],{type:"image/svg+xml"}));a.download=(cur.title||"layout").replace(/\W+/g,"_")+".svg";a.click()};
 const P=$("presets");PRESETS.forEach((p,i)=>{const b=document.createElement("button");b.textContent=p.title||`Layout ${i+1}`;
   b.onclick=()=>{P.querySelectorAll("button").forEach(x=>x.classList.remove("on"));b.classList.add("on");load(p)};P.appendChild(b)});
 if(PRESETS.length<2)P.style.display="none";
 P.firstChild&&P.firstChild.classList.add("on");load(PRESETS[0]);
 window.addEventListener("resize",()=>render());
-window.distlayout={build,pyText,attrText,airText,plan};
+window.distlayout={build,pyText,attrText,airText,plan,parseExpr,strE};
 </script></body></html>

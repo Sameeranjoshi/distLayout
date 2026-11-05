@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from .decomposition import Decomposition, PartitionId
-from .mapping import Coord, Mapping
+from .mapping import Coord, Mapping, as_placement
 from .region import Box, Index, as_index
 
 
@@ -93,14 +93,29 @@ class MaterializationPlan:
 
 
 class DistributedView:
-    """A non-owning ``DataSource + Decomposition + Mapping``."""
+    """A non-owning ``DataSource + Decomposition + Mapping`` (placement ``Map`` or ``OwnerMap``).
 
-    def __init__(self, source: DataSource, decomposition: Decomposition, mapping: Mapping) -> None:
+    A PE holds zero or more pieces. With one piece per PE (any placement
+    ``Map``), the local buffer is the piece itself. When some PE holds several
+    (owner maps such as cyclic), every PE's local buffer is a stack of tiles,
+    ``(slot, *tile_shape)``, slot ``s`` being the PE's s-th piece in piece
+    order; with tiles of different shapes it is flat, ``(n_elements,)``.
+    """
+
+    def __init__(self, source: DataSource, decomposition: Decomposition, mapping: Any) -> None:
         decomposition.check(source.global_shape)
         mapping.check(decomposition.num_parts(source.global_shape))
         self.source = source
         self.decomposition = decomposition
         self.mapping = mapping
+        at: Dict[Coord, List[PartitionId]] = {pe: [] for pe in mapping.grid.coords()}
+        for pid in decomposition.partitions(source.global_shape):
+            for h in mapping.pes_of(pid)[1]:
+                at[h].append(pid)
+        self._at = {pe: tuple(v) for pe, v in at.items()}
+        self.max_pieces = max((len(v) for v in self._at.values()), default=0)
+        sizes = {self.partition_region(pid).size for pid in self.partitions()}
+        self._tile = next(iter(sizes)) if len(sizes) == 1 else None
 
     # -- basic facts --------------------------------------------------------
 
@@ -112,15 +127,27 @@ class DistributedView:
     def grid(self):
         return self.mapping.grid
 
+    @property
+    def stacked(self) -> bool:
+        """True when local buffers are stacks of tiles (some PE holds several pieces)."""
+        return self.max_pieces > 1
+
     def partitions(self) -> Iterator[PartitionId]:
         return self.decomposition.partitions(self.shape)
 
     def partition_region(self, pid: PartitionId) -> Box:
         return self.decomposition.region(pid, self.shape)
 
+    def pieces_at(self, pe: Sequence[int]) -> Tuple[PartitionId, ...]:
+        """The pieces this PE holds (primary or replica), in piece order."""
+        return self._at[self.grid.check(pe)]
+
     def partition_at(self, pe: Sequence[int]) -> PartitionId:
-        pe = self.grid.check(pe)
-        return self.mapping.partition_at(pe, len(self.decomposition.rules))
+        """The single piece at ``pe``; raises when it holds none or several (see :meth:`pieces_at`)."""
+        ps = self.pieces_at(pe)
+        if len(ps) != 1:
+            raise ValueError(f"PE {tuple(as_index(pe))} holds {len(ps)} pieces; use pieces_at()")
+        return ps[0]
 
     def partition_of(self, index: int | Sequence[int]) -> PartitionId:
         return self.decomposition.partition_of(as_index(index), self.shape)
@@ -135,46 +162,77 @@ class DistributedView:
         primary, holders = self.mapping.pes_of(self.partition_of(index))
         return (primary,) + tuple(h for h in holders if h != primary)
 
+    def held_regions(self, pe: Sequence[int]) -> Tuple[Box, ...]:
+        return tuple(self.partition_region(pid) for pid in self.pieces_at(pe))
+
     def held_region(self, pe: Sequence[int]) -> Box:
-        """What this PE stores, primary or replica."""
+        """What this PE stores, when it is one piece (see :meth:`held_regions`)."""
         return self.partition_region(self.partition_at(pe))
 
+    def owned_regions(self, pe: Sequence[int]) -> Tuple[Box, ...]:
+        """What this PE is the primary owner of; empty on a pure replica."""
+        return self.held_regions(pe) if self.is_primary(pe) else ()
+
     def owned_region(self, pe: Sequence[int]) -> Optional[Box]:
-        """What this PE is the primary owner of; ``None`` on a pure replica."""
-        pe = self.grid.check(pe)
-        return self.held_region(pe) if self.mapping.is_primary(pe) else None
+        """Single-piece form of :meth:`owned_regions`; ``None`` on a pure replica."""
+        return self.held_region(pe) if self.is_primary(pe) else None
 
     def is_primary(self, pe: Sequence[int]) -> bool:
         return self.mapping.is_primary(self.grid.check(pe))
 
     def local_shape(self, pe: Sequence[int]) -> Index:
         """Valid local extent at ``pe`` (exact; no padding)."""
-        return self.held_region(pe).size
+        regs = self.held_regions(pe)
+        if not self.stacked:
+            return regs[0].size if regs else (0,) * len(self.shape)
+        if self._tile is not None:
+            return (len(regs),) + self._tile
+        return (sum(r.volume for r in regs),)
 
     def max_local_shape(self) -> Index:
         """Per-axis maximum of :meth:`local_shape` -- an allocation size that fits every PE."""
         shapes = [self.local_shape(pe) for pe in self.grid.coords()]
-        return tuple(max(s[d] for s in shapes) for d in range(len(self.shape)))
+        return tuple(max(s[d] for s in shapes) for d in range(len(shapes[0])))
 
     def is_uniform(self) -> bool:
         return self.decomposition.is_uniform(self.shape)
 
     def is_local(self, index: int | Sequence[int], pe: Sequence[int]) -> bool:
-        return self.held_region(pe).contains(as_index(index))
+        index = as_index(index)
+        return any(r.contains(index) for r in self.held_regions(pe))
 
     def local_index(self, index: int | Sequence[int], pe: Sequence[int]) -> Index:
         index, pe = as_index(index), as_index(pe)
-        region = self.held_region(pe)
-        if not region.contains(index):
-            raise KeyError(f"PE {tuple(pe)} does not hold element {index} (it holds {region})")
-        return tuple(i - o for i, o in zip(index, region.offset))
+        regs = self.held_regions(pe)
+        base = 0
+        for slot, r in enumerate(regs):
+            if r.contains(index):
+                off = tuple(i - o for i, o in zip(index, r.offset))
+                if not self.stacked:
+                    return off
+                if self._tile is not None:
+                    return (slot,) + off
+                return (base + _rowmajor(off, r.size),)
+            base += r.volume
+        raise KeyError(f"PE {tuple(pe)} does not hold element {index} (it holds {', '.join(map(str, regs)) or 'nothing'})")
 
     def global_index(self, local: int | Sequence[int], pe: Sequence[int]) -> Index:
         local, pe = as_index(local), as_index(pe)
-        region = self.held_region(pe)
-        if not Box.full(region.size).contains(local):
-            raise IndexError(f"local index {local} outside PE {tuple(pe)}'s extent {region.size}")
-        return tuple(l + o for l, o in zip(local, region.offset))
+        regs = self.held_regions(pe)
+        if not Box.full(self.local_shape(pe)).contains(local):
+            raise IndexError(f"local index {local} outside PE {tuple(pe)}'s extent {self.local_shape(pe)}")
+        if not self.stacked:
+            r, off = regs[0], local
+        elif self._tile is not None:
+            r, off = regs[local[0]], local[1:]
+        else:
+            k = local[0]
+            for r in regs:
+                if k < r.volume:
+                    break
+                k -= r.volume
+            off = _unrowmajor(k, r.size)
+        return tuple(l + o for l, o in zip(off, r.offset))
 
     # -- source coordinates -------------------------------------------------
 
@@ -187,49 +245,49 @@ class DistributedView:
     # -- materialization ----------------------------------------------------
 
     def plan(self, pe: Sequence[int], request: Optional[Box] = None) -> MaterializationPlan:
-        """How ``request`` (default: what ``pe`` holds) becomes available at ``pe``.
+        """How ``request`` (default: what ``pe`` holds, if one piece) becomes available at ``pe``.
 
-        Splits the request at partition boundaries. Pieces ``pe`` already holds
-        are ``local``; the rest come from their primary owner. The request is
-        given explicitly: inferring it from a computation's accesses is a later
-        compiler pass.
+        Splits the request at piece boundaries. Pieces ``pe`` already holds are
+        ``local``; the rest come from their primary owner. The request is
+        explicit: inferring it from a computation's accesses is a later pass.
         """
         pe = self.grid.check(pe)
         request = self.held_region(pe) if request is None else request
         if not Box.full(self.shape).contains_box(request):
             raise ValueError(f"request {request} outside tensor of shape {self.shape}")
-        mine = self.held_region(pe)
+        mine = self.held_regions(pe)
         out: List[Transfer] = []
         for pid in self.partitions():
             piece = self.partition_region(pid).intersect(request)
             if piece is None:
                 continue
             dst = tuple(p - r for p, r in zip(piece.offset, request.offset))
-            local = mine.contains_box(piece)
+            local = any(m.contains_box(piece) for m in mine)
             out.append(Transfer(piece, dst, None if local else self.mapping.pes_of(pid)[0], local))
         return MaterializationPlan(pe, request, tuple(out))
 
     # -- checking and printing ---------------------------------------------
 
     def validate(self) -> None:
-        """Check the v0 invariants by enumeration. For tests and small shapes.
+        """Check the invariants by enumeration. For tests and small shapes.
 
-        * every element has exactly one primary partition (cover, no overlap);
+        * every element has exactly one piece (cover, no overlap);
         * the primary owner holds the element;
         * replicas never change the primary owner;
-        * local_index / global_index round-trip on every PE.
+        * local_index / global_index round-trip on every PE, and local indices
+          are distinct within a PE.
         """
         seen: Dict[Index, PartitionId] = {}
         for pid in self.partitions():
             for i in self.partition_region(pid).indices():
                 if i in seen:
-                    raise AssertionError(f"element {i} in partitions {seen[i]} and {pid}")
+                    raise AssertionError(f"element {i} in pieces {seen[i]} and {pid}")
                 seen[i] = pid
         full = set(Box.full(self.shape).indices())
         if set(seen) != full:
             missing = sorted(full - set(seen))[:5]
-            raise AssertionError(f"elements not in any partition, e.g. {missing}")
-        for i, pid in seen.items():
+            raise AssertionError(f"elements not in any piece, e.g. {missing}")
+        for i in seen:
             p = self.primary_owner(i)
             if not self.is_primary(p) or not self.is_local(i, p):
                 raise AssertionError(f"primary owner {p} of {i} is not a primary holder")
@@ -237,31 +295,55 @@ class DistributedView:
                 if not self.is_local(i, h):
                     raise AssertionError(f"holder {h} of {i} does not hold it")
         for pe in self.grid.coords():
-            for i in self.held_region(pe).indices():
-                if self.global_index(self.local_index(i, pe), pe) != i:
-                    raise AssertionError(f"index round trip failed at PE {pe}, element {i}")
+            used = set()
+            for r in self.held_regions(pe):
+                for i in r.indices():
+                    li = self.local_index(i, pe)
+                    if li in used or self.global_index(li, pe) != i:
+                        raise AssertionError(f"index round trip failed at PE {pe}, element {i}")
+                    used.add(li)
 
     def table(self) -> str:
-        """One line per PE: held region, local shape, primary or replica."""
-        lines = [f"tensor {self.shape} on grid {self.grid.shape}: {self.decomposition!r}"]
+        """One line per PE: pieces held, local shape, primary or replica."""
+        lines = [f"tensor {self.shape} on grid {self.grid.shape}: {self.decomposition!r}, {self.mapping!r}"]
         for pe in self.grid.coords():
             role = "primary" if self.is_primary(pe) else "replica"
-            lines.append(f"  PE {pe}: {self.held_region(pe)}  local {self.local_shape(pe)}  {role}")
+            regs = ", ".join(map(str, self.held_regions(pe))) or "nothing"
+            lines.append(f"  PE {pe}: {regs}  local {self.local_shape(pe)}  {role}")
         return "\n".join(lines)
 
     def to_attr(self) -> str:
         """Textual form of the layout, a sketch of the future ``#dist.layout`` attribute."""
         rules = ", ".join(_rule_attr(r) for r in self.decomposition.rules)
-        place = ", ".join(f"{k} -> g{g}" for k, g in self.mapping.place)
         rep = ", ".join(f"g{g}" for g in self.mapping.replicate)
-        return (f"#dist.layout<shape = {list(self.shape)}, grid = {list(self.grid.shape)}, "
-                f"decomp = [{rules}], place = [{place}], replicate = [{rep}]>")
+        head = f"#dist.layout<shape = {list(self.shape)}, grid = {list(self.grid.shape)}, decomp = [{rules}], "
+        pm = as_placement(self.mapping, self.decomposition.num_parts(self.shape))
+        if pm is not None:
+            place = ", ".join(f"{k} -> g{g}" for k, g in pm.place)
+            return head + f"place = [{place}], replicate = [{rep}]>"
+        owner = ", ".join(f"g{g} = {e}" for g, e in sorted(self.mapping.exprs().items()))
+        return head + f"owner = [{owner}], replicate = [{rep}]>"
 
     def __repr__(self) -> str:
         return f"DistributedView({self.to_attr()})"
 
 
-def bind(source: Any, decomposition: Decomposition, mapping: Mapping,
+def _rowmajor(off: Index, size: Index) -> int:
+    k = 0
+    for o, s in zip(off, size):
+        k = k * s + o
+    return k
+
+
+def _unrowmajor(k: int, size: Index) -> Index:
+    out = []
+    for s in reversed(size):
+        out.append(k % s)
+        k //= s
+    return tuple(reversed(out))
+
+
+def bind(source: Any, decomposition: Decomposition, mapping: Any,
          global_shape: Optional[Sequence[int]] = None) -> DistributedView:
     """Attach a layout to existing data. Metadata only: nothing is copied.
 
