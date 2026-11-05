@@ -114,6 +114,16 @@ def copy_mlir(view, halo=0):
         return f"// not emitted: {e}"
 
 
+def ghost_mlir(view, pattern):
+    """Real MLIR of the ghost-gather kernel for an irregular preset."""
+    try:
+        from distlayout import inspect
+        from distlayout.backends import air as air_backend
+        return str(air_backend.ghost_gather_kernel(inspect(view, pattern), view.shape[0]).build(target="npu2"))
+    except ImportError:
+        return None
+
+
 def main(out):
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -121,7 +131,7 @@ def main(out):
     for name, view, kw in presets():
         view.validate()
         if "mlir" not in kw:
-            kw["mlir"] = copy_mlir(view, kw.get("halo", 0))
+            kw["mlir"] = ghost_mlir(view, kw["pattern"]) if "pattern" in kw else copy_mlir(view, kw.get("halo", 0))
         entries.append((name, view, {k: v for k, v in kw.items() if v is not None}))
     out.write_text(render_explorer(entries))
     print(f"  wrote {out}")

@@ -205,6 +205,24 @@ class _TextBuf:
         return self.name
 
 
+def _ghost_code(sched: Any, src: str) -> str:
+    """The ghost-gather herd body for an irregular schedule, traced into text."""
+    from .backends import air as backend
+    from .backends.schedule import Text
+    w = _TextAir()
+    F = backend.ghost_footprint(sched)
+    pe0 = next(iter(sched))
+    names = ["tx", "ty", "tz"][: len(pe0)]
+    backend.ghost_load(sched, _TextBuf("x_local", [F]), [Text.var(n) for n in names], _TextBuf(src, [0]), air=w)
+    runs = sum(len(backend.gather_runs(p)) for p in sched.values())
+    grid = [max(pe[g] for pe in sched) + 1 for g in range(len(pe0))]
+    head = [f"with air.herd([{', '.join(f'range({n})' for n in grid)}]) as h:", "  @h.body", f"  def _({', '.join(names)}):",
+            f"    x_local = air.alloc([{F}], f32, scope=h.private())    # owned, then ghosts (local CSR order)"]
+    return "\n".join(head + w.lines + ["    ...                                   # local SpMV on x_local", "",
+                                        f"# one branch per PE, one static DMA per run of ids: {runs} DMAs in total",
+                                        "# air_backend.ghost_load(sched, x_local, coords, l2_x)"])
+
+
 def _traced_code(view: DistributedView, names: List[str], src: str, dtype: str, halo: int) -> str:
     """The herd body the AIR backend emits for ``view``, traced into text."""
     from .backends import air as backend
@@ -294,6 +312,7 @@ def to_spec(view: DistributedView, title: str = "", note: str = "", halo: int = 
         ix = {pe: k for k, pe in enumerate(view.grid.coords())}
         spec["ghosts"] = [len(sched[pe].ghosts) for pe in view.grid.coords()]
         spec["imports"] = [[ix[pe], ix[src], len(ids)] for pe, pl in sched.items() for src, ids in pl.imports.items()]
+        spec["air"] = _ghost_code(sched, src)
         if positions is not None:
             spec["graph"] = {"pos": [list(map(int, q)) for q in positions],
                              "edges": [[i, j] for i in range(pattern.nrows) for j in pattern.row(i) if i < j]}
@@ -508,6 +527,7 @@ function attrText(L){
   if(L.table)return head+`owner = table<[${L.table.join(", ")}]>, `+rep;
   return head+`owner = [${L.exprs.map((e,g)=>e?`g${g} = ${strE(e)}`:null).filter(Boolean).join(", ")}], `+rep}
 function airText(L){
+  if(L.spec.imports&&cur.air)return cur.air;          // irregular access: the ghost gather
   if(!L.placement||!L.uniform||(+L.spec.halo||0)>0)return cur.air||"# This layout is emitted with loops (owner maps) or one branch per size class\n# (uneven, halo), which the Python backend computes: air_backend.for_each_piece /\n# halo_load. python3 examples/gallery.py embeds the emitted code for each preset;\n# editing the layout here drops it.";
   const names=["tx","ty","tz"].slice(0,L.grid.length), src=L.spec.src||"l2", gOf=k=>(L.place.find(p=>p[0]===k)||[0,-1])[1];
   const sub=L.shape.map((n,a)=>{const k=L.rules.findIndex(r=>r.axis===a);if(k<0)return `0 : ${n}`;const b=L.rules[k].sizes[0],c=names[gOf(k)];return `${c}*${b} : ${c}*${b} + ${b}`}).join(", ");

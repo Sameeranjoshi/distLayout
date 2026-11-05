@@ -148,3 +148,21 @@ def test_region_copy_kernel_builds(name):
         assert f in text, f
     if halo:
         assert "memref.store %cst" in text          # edge PEs zero their ghost cells
+
+
+# -- category 3: ghost gathers ---------------------------------------------------------
+
+def test_ghost_gather_kernel_builds_one_dma_per_run():
+    import random as _random
+    from distlayout import bfs_partition, grid_graph, inspect, owner_array, renumber
+    perm = list(range(64))
+    _random.Random(1).shuffle(perm)
+    pat = grid_graph(8, 8, perm)
+    owner = bfs_partition(pat, 4)
+    p2, new = renumber(owner)
+    for o, pt in ((owner, pat), (new, pat.permute(p2))):
+        sched = inspect(bind(_Shape(64), *owner_array(o)), pt)
+        text = str(air_backend.ghost_gather_kernel(sched, 64).build(target="npu2"))
+        loads = [l for l in text.splitlines() if "dma_memcpy_nd" in l and "memref<64xf32, 1" in l and "2 : i32>, memref" in l]
+        assert len(loads) == sum(len(air_backend.gather_runs(p)) for p in sched.values())
+        assert text.count("scf.if") >= 3                       # one branch per PE

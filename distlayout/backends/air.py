@@ -463,3 +463,107 @@ def copy_kernel(view: DistributedView, dtype: Any = None, cores: Optional[Sequen
                                 lambda tx, ty, tz: body(tx, ty, tz)][rank - 1])
                     air.ops.store(l2_out, C)
     return launch
+
+
+# -- irregular: ghost gathers from the inspector's schedule --------------------------
+
+def gather_runs(plan) -> List[Tuple[int, int, int]]:
+    """``[(dst_offset, src_start, length), ...]`` filling a PE's local x in local order (owned, then ghosts)."""
+    out, off = [], 0
+    for ids in (plan.owned, plan.ghosts):
+        for a, b in ids.runs:
+            out.append((off, a, b - a))
+            off += b - a
+    return out
+
+
+def for_each_pe(grid_shape: Sequence[int], coords: Sequence[Any], body: Callable[[Tuple[int, ...]], Any],
+                air: Any = None) -> None:
+    """Call ``body(pe)`` with the concrete PE coordinate, inside one ``air.ops.branch`` chain per grid axis.
+
+    For code that differs per PE (irregular schedules). With concrete ``coords``
+    the PE is picked in Python.
+    """
+    air = air or _air()
+
+    def go(g: int, prefix: Tuple[int, ...]) -> None:
+        if g == len(grid_shape):
+            body(prefix)
+            return
+        x, n = coords[g], grid_shape[g]
+        if isinstance(x, int) or n == 1:
+            go(g + 1, prefix + ((x if isinstance(x, int) else 0),))
+            return
+
+        def chain(v: int) -> None:
+            if v == n - 1:
+                go(g + 1, prefix + (v,))
+                return
+            with air.ops.branch(x <= v) as b:
+                go(g + 1, prefix + (v,))
+            with b.otherwise():
+                chain(v + 1)
+        chain(0)
+    go(0, ())
+
+
+def ghost_footprint(sched) -> int:
+    """L1 elements for the largest local x (owned + ghosts) over all PEs."""
+    return max(p.x_footprint for p in sched.values())
+
+
+def ghost_load(sched, dst: Any, coords: Sequence[Any], src: Any, air: Any = None) -> None:
+    """Fill ``dst`` with this PE's local x -- owned ids, then ghosts -- straight from the L2 copy ``src``.
+
+    One static DMA per contiguous run of ids, one branch per PE. The order is
+    the local numbering :meth:`GhostPlan.local_csr` uses, so a local SpMV can
+    run on ``dst`` as is.
+    """
+    air = air or _air()
+    grid_shape = tuple(max(pe[g] for pe in sched) + 1 for g in range(len(next(iter(sched)))))
+    F = ghost_footprint(sched)
+
+    def body(pe):
+        for off, start, n in gather_runs(sched[pe]):
+            d = dst if (off == 0 and n == F) else dst[off:off + n]
+            air.ops.load(d, src[start:start + n])
+    for_each_pe(grid_shape, coords, body, air=air)
+
+
+def ghost_gather_kernel(sched, n: int, dtype: Any = None, name: str = "ghost_gather", air: Any = None) -> Any:
+    """``X`` (L3, n) -> L2 -> each PE gathers owned + ghost x into L1 -> ``Y[p, :footprint_p]`` (L3, P x F).
+
+    Row ``p`` of ``Y`` must equal ``x[local_ids(p)]``: this checks every gather
+    DMA end to end. Grids are flattened to a linear PE index for ``Y``.
+    """
+    air = air or _air()
+    if dtype is None:
+        from air.api.types import f32 as dtype  # type: ignore[import-not-found]
+    pes = sorted(sched)
+    grid_shape = tuple(max(pe[g] for pe in pes) + 1 for g in range(len(pes[0])))
+    F, P = ghost_footprint(sched), len(pes)
+    X = air.tensor([n], dtype)
+    Y = air.tensor([P, F], dtype)
+    with air.launch(name=name) as launch:
+        @launch.body
+        def _():
+            with air.segment(name=name + "_seg") as seg:
+                @seg.body
+                def _():
+                    l2_x = air.alloc([n], dtype, scope=seg.private())
+                    l2_y = air.alloc([P, F], dtype, scope=seg.private())
+                    air.ops.load(l2_x, X)
+                    with air.herd([range(g) for g in grid_shape], name=name + "_herd") as h:
+                        def body(*coords):
+                            a = air.alloc([F], dtype, scope=h.private())
+                            ghost_load(sched, a, coords, l2_x, air=air)
+
+                            def store(pe):
+                                p = pes.index(pe)
+                                fp = sched[pe].x_footprint
+                                air.ops.store(a if fp == F else a[0:fp], l2_y[p:p + 1, 0:fp])
+                            for_each_pe(grid_shape, coords, store, air=air)
+                        h.body([lambda tx: body(tx), lambda tx, ty: body(tx, ty),
+                                lambda tx, ty, tz: body(tx, ty, tz)][len(grid_shape) - 1])
+                    air.ops.store(l2_y, Y)
+    return launch

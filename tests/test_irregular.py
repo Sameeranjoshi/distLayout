@@ -127,3 +127,59 @@ def test_mesh_helpers_and_errors():
         CSRPattern([0, 2], [0])                          # rowptr does not end at len(colidx)
     with pytest.raises(ValueError):
         inspect(bind(Buf(5), *owner_array([0, 0, 1, 1, 1])), grid_graph(2, 3))
+
+
+# -- the executor: distributed SpMV equals dense A @ x --------------------------
+
+from distlayout import exchange, gather, scatter, spmv  # noqa: E402
+
+
+def dense_spmv(pattern, values, x):
+    return [sum(values[k] * x[pattern.colidx[k]] for k in range(pattern.rowptr[i], pattern.rowptr[i + 1]))
+            for i in range(pattern.nrows)]
+
+
+@pytest.mark.parametrize("which", ["block", "random", "bfs", "renumbered", "replicated_rows"])
+def test_distributed_spmv_matches_dense(which):
+    rng = random.Random(7)
+    perm = list(range(36))
+    rng.shuffle(perm)
+    pat = grid_graph(6, 6, perm)
+    owner = {"block": block_partition(36, 4), "random": random_partition(36, 4, seed=2),
+             "bfs": bfs_partition(pat, 4), "renumbered": bfs_partition(pat, 4),
+             "replicated_rows": block_partition(36, 4)}[which]
+    if which == "renumbered":
+        p2, owner = renumber(owner)
+        pat = pat.permute(p2)
+    values = [rng.uniform(-1, 1) for _ in range(pat.nnz)]
+    x = [rng.uniform(-1, 1) for _ in range(36)]
+    if which == "replicated_rows":       # rows on a 4x2 grid, each row block replicated along g1
+        d, m = owner_array(owner)
+        view = bind(Buf(36), d, TableMap(Grid((4, 2)), [(p, 0) for p in m.linear()], replicate=[1]))
+    else:
+        view = bind(Buf(36), *owner_array(owner))
+    sched = inspect(view, pat)
+    y = gather(view, spmv(sched, pat, values, scatter(view, x)))
+    assert y == pytest.approx(dense_spmv(pat, values, x))
+
+
+def test_exchange_uses_only_export_lists():
+    pat = grid_graph(4, 4)
+    view = bind(Buf(16), *owner_array(block_partition(16, 2)))
+    sched = inspect(view, pat)
+    x = list(range(100, 116))
+    got = exchange(sched, scatter(view, x))
+    assert got[(1,)] == [x[g] for g in sched[(1,)].ghosts]           # PE 1 receives ids 4..7 from PE 0
+    assert sched[(1,)].ghosts.ids() == [4, 5, 6, 7]
+
+
+def test_rectangular_spmv_with_its_own_x_layout():
+    rng = random.Random(1)
+    pat = CSRPattern.from_rows([[0, 5], [1, 7], [2, 3], [6]], ncols=8)
+    rows = bind(Buf(4), Decomposition(Block(0, 2)), Map(Grid(2), {0: 0}))
+    xv = bind(Buf(8), *owner_array([1, 0, 0, 1, 1, 0, 1, 0]))
+    values = [rng.uniform(-1, 1) for _ in range(pat.nnz)]
+    x = [rng.uniform(-1, 1) for _ in range(8)]
+    sched = inspect(rows, pat, xv)
+    y = spmv(sched, pat, values, scatter(xv, x))
+    assert y[(0,)] + y[(1,)] == pytest.approx(dense_spmv(pat, values, x))

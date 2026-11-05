@@ -228,6 +228,18 @@ class GhostPlan:
         pos = {g: k for k, g in enumerate(self.local_ids())}
         return CSRPattern.from_rows([[pos[c] for c in pattern.row(i)] for i in self.rows], ncols=len(pos))
 
+    def local_matrix(self, pattern: CSRPattern, values: Sequence[float]) -> Tuple[CSRPattern, List[float]]:
+        """:meth:`local_csr` plus the matching values (``values`` aligned with ``pattern.colidx``)."""
+        pos = {g: k for k, g in enumerate(self.local_ids())}
+        rowptr, colidx, vals = [0], [], []
+        for i in self.rows:
+            entries = sorted((pos[c], values[k]) for k, c in zip(range(pattern.rowptr[i], pattern.rowptr[i + 1]),
+                                                                   pattern.row(i)))
+            colidx += [c for c, _ in entries]
+            vals += [v for _, v in entries]
+            rowptr.append(len(colidx))
+        return CSRPattern(rowptr, colidx, ncols=len(pos)), vals
+
     @property
     def x_footprint(self) -> int:
         """x entries this PE stores: owned + ghosts (vs ``ncols`` if x were replicated)."""
@@ -289,3 +301,54 @@ def inspect(rows: DistributedView, pattern: CSRPattern, x: Optional[DistributedV
         for src, ids in p.imports.items():
             sched[src].exports[pe] = ids
     return sched
+
+
+# -- the executor (reference, in Python) ----------------------------------------------
+
+def scatter(view: DistributedView, data: Sequence[float]) -> Dict[Tuple[int, ...], List[float]]:
+    """Each PE's local copy of a global vector: its held ids, in local order (ascending)."""
+    return {pe: [data[i] for i in _ids_at(view, pe)] for pe in view.grid.coords()}
+
+
+def gather(view: DistributedView, local: Dict[Tuple[int, ...], Sequence[float]]) -> List[float]:
+    """The global vector back from primary owners' local copies."""
+    out: List[Optional[float]] = [None] * view.shape[0]
+    for pe in view.grid.coords():
+        if view.is_primary(pe):
+            for i, v in zip(_ids_at(view, pe), local[pe]):
+                out[i] = v
+    if any(v is None for v in out):
+        raise ValueError("some ids have no primary owner's value")
+    return out  # type: ignore[return-value]
+
+
+def exchange(sched: GhostSchedule, x_local: Dict[Tuple[int, ...], Sequence[float]]) -> Dict[Tuple[int, ...], List[float]]:
+    """Ghost values per PE, delivered along the **export** lists (what each owner sends).
+
+    Each sender looks its ids up in its own local array only, so a wrong export
+    list or local numbering shows up as a wrong value at the receiver.
+    """
+    inbox: Dict[Tuple[int, ...], Dict[int, float]] = {pe: {} for pe in sched}
+    for src, plan in sched.items():
+        pos = {g: k for k, g in enumerate(plan.owned.ids())}
+        for dst, ids in plan.exports.items():
+            for g in ids:
+                inbox[dst][g] = x_local[src][pos[g]]
+    return {pe: [inbox[pe][g] for g in plan.ghosts] for pe, plan in sched.items()}
+
+
+def spmv(sched: GhostSchedule, pattern: CSRPattern, values: Sequence[float],
+         x_local: Dict[Tuple[int, ...], Sequence[float]]) -> Dict[Tuple[int, ...], List[float]]:
+    """``y = A @ x`` the distributed way: exchange ghosts, then a purely local CSR multiply per PE.
+
+    ``values`` are aligned with ``pattern.colidx``. Returns each PE's ``y`` for
+    its rows (ascending). Every PE reads only its own ``x`` and its ghosts.
+    """
+    ghosts = exchange(sched, x_local)
+    y: Dict[Tuple[int, ...], List[float]] = {}
+    for pe, plan in sched.items():
+        xl = list(x_local[pe]) + ghosts[pe]                 # local numbering: owned, then ghosts
+        local, vals = plan.local_matrix(pattern, values)
+        y[pe] = [sum(vals[k] * xl[local.colidx[k]] for k in range(local.rowptr[r], local.rowptr[r + 1]))
+                 for r in range(local.nrows)]
+    return y

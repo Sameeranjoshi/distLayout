@@ -62,11 +62,12 @@ with air.herd(air_backend.herd_space(view), shape=(2,)) as h:
 | | Rank splitting `refine(view, axis, k)` → `owner(tx, ty)` | ✅ | ✅ | ✅ |
 | | Coefficients invertible mod P (modular inverse); pieces not dividing evenly over PEs (uniform trips + per-trip guard) | ✅ | ✅ | ✅ |
 | | Coefficients with gcd(a, P) > 1; owner maps with halo or uneven tiles | ✅ | ✅ | ❌ refused with a reason (guarded scan / lookup table; combine piece loop + size classes) |
-| 3. Irregular | Owner arrays (`owner_array` → runs + `TableMap`) | ✅ | ✅ | ✅ when renumbered contiguous (becomes an uneven block); scattered tables ❌ not yet |
+| 3. Irregular | Owner arrays (`owner_array` → runs + `TableMap`) | ✅ | ✅ | ✅ owned + ghost x via `ghost_load`, any table; renumbered tables also as an uneven block |
 | | Sparse access pattern (`CSRPattern`; graphs as adjacency) | ✅ | ✅ graph view, cut edges | — |
-| | Inspector: owned / ghost sets, import & export lists, local CSR (`inspect`) | ✅ | ✅ ghost counts, import arcs | ❌ not yet (ghost gathers from L2) |
+| | Inspector: owned / ghost sets, import & export lists, local CSR (`inspect`) | ✅ | ✅ ghost counts, import arcs | ✅ `ghost_load`: one branch per PE, one static DMA per id run from L2 |
 | | Partitioners: block, random, BFS graph growing; `renumber` | ✅ | ✅ | — |
-| | Executor (ghost exchange + local SpMV), runtime-changing patterns | ❌ | ❌ | ❌ |
+| | Executor: `scatter` / `exchange` (along export lists) / `spmv` (local CSR) / `gather` | ✅ checked against dense `A @ x` | — | data movement only (no sparse compute in `air.api`) |
+| | Patterns that change at run time (run-time inspector) | ❌ | ❌ | ❌ |
 | Transitions | `redistribute`, `plan_redistribution` | ❌ | ❌ | ❌ |
 | Native MLIR | `#dist.layout` attribute, `dist.bind` op | text only (`to_attr`) | | |
 
@@ -172,6 +173,18 @@ On a scrambled 8×8 mesh over 4 PEs:
 | BFS graph growing | 56 | 41 |
 
 With rows and x partitioned alike, each PE stores 16 owned + 8 to 12 ghost x entries instead of all 64. That's de-replication.
+
+**Executor.** `y = gather(rows, spmv(sched, pattern, values, scatter(x_view, x)))` computes `A @ x` the distributed way:
+1. ghosts travel only along the export lists;
+2. each PE multiplies with its local CSR.
+
+The tests check the result against a dense product for block, random, BFS, renumbered and replicated layouts.
+
+**AIR.** `ghost_load(sched, x_local, coords, l2_x)` fills each PE's local x (owned, then ghosts, in local-CSR order) from the L2 copy:
+- one `air.ops.branch` per PE, since every PE's list differs;
+- one static DMA per contiguous run of ids.
+
+`ghost_gather_kernel(sched, n)` is a complete, checkable kernel: `Y[p] == x[local_ids(p)]`. On the scrambled mesh, renumbering cuts the gather from 84 DMAs to 39, with each PE's owned part becoming one 16-element DMA. The rest are single-element ghost runs, the real cost of irregular data on a DMA machine.
 
 ## Visualize
 
