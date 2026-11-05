@@ -3,7 +3,7 @@
 ``air.api``'s ``IndexExpr`` (``python/air/api/_index.py``) is pure Python, so the
 herd coordinates here are the *real* upstream index type when an MLIR-AIR
 checkout is available (``MLIR_AIR_SRC``, default ``~/xilinx/mlir-air``). Buffers
-and ``air.ops`` are recording fakes: the test checks the exact subscripts
+and ``air.ops`` are virtual, recording stand-ins: the test checks the exact subscripts
 handed to ``air.ops.load``/``store``, which is everything the adapter decides.
 """
 
@@ -32,7 +32,7 @@ def _load_index_module():
 INDEX = _load_index_module()
 
 
-class FakeBuffer:
+class VirtualBuffer:
     def __init__(self, name, *shape):
         self.name, self.shape = name, shape
 
@@ -40,7 +40,7 @@ class FakeBuffer:
         return ("region", self.name, key)
 
 
-class FakeAir:
+class VirtualAir:
     def __init__(self):
         self.calls = []
         outer = self
@@ -58,7 +58,7 @@ class FakeAir:
 
     def alloc(self, shape, dtype, scope=None):
         self.calls.append(("alloc", shape, dtype, scope))
-        return FakeBuffer("l1", *shape)
+        return VirtualBuffer("l1", *shape)
 
 
 def coord(name):
@@ -82,7 +82,7 @@ def key_forms(key):
 
 def test_block_matches_handwritten_eltwise_add():
     n, tile_n = 16384, 1024
-    l2 = FakeBuffer("l2_a", n)
+    l2 = VirtualBuffer("l2_a", n)
     v = bind(l2, Decomposition(Block(0, n // tile_n)), Map(Grid(n // tile_n), {0: 0}))
     tx = coord("tx")
     key = air_backend.slice_key(v, (tx,))
@@ -94,59 +94,59 @@ def test_block_matches_handwritten_eltwise_add():
 
 
 def test_load_store_and_alloc_calls():
-    fake = FakeAir()
-    l2 = FakeBuffer("l2_a", 100)
+    virtual_air = VirtualAir()
+    l2 = VirtualBuffer("l2_a", 100)
     v = bind(l2, Decomposition(Block(0, 4)), Map(Grid(4), {0: 0}))
     tx = coord("tx")
-    a = air_backend.alloc_local(v, "f32", scope="h.private", air=fake)
-    air_backend.load_local(v, a, (tx,), air=fake)
-    air_backend.store_local(v, a, (tx,), dst=FakeBuffer("l2_c", 100), air=fake)
-    assert fake.calls[0] == ("alloc", [25], "f32", "h.private")
-    kind, dst, (_, name, key) = fake.calls[1]
+    a = air_backend.alloc_local(v, "f32", scope="h.private", air=virtual_air)
+    air_backend.load_local(v, a, (tx,), air=virtual_air)
+    air_backend.store_local(v, a, (tx,), dst=VirtualBuffer("l2_c", 100), air=virtual_air)
+    assert virtual_air.calls[0] == ("alloc", [25], "f32", "h.private")
+    kind, dst, (_, name, key) = virtual_air.calls[1]
     assert (kind, dst, name) == ("load", a, "l2_a")
     assert key_forms(key) == [(({"tx": 25}, 0), ({"tx": 25}, 25))]
-    kind, src, (_, name, key) = fake.calls[2]
+    kind, src, (_, name, key) = virtual_air.calls[2]
     assert (kind, name) == ("store", "l2_c")
 
 
 def test_replicated_axis_does_not_enter_offset():
     # 4 blocks on a 4x4 herd, replicated along ty: every ty names the same region
-    v = bind(FakeBuffer("l2", 100), Decomposition(Block(0, 4)), Map(Grid((4, 4)), {0: 0}, replicate=[1]))
+    v = bind(VirtualBuffer("l2", 100), Decomposition(Block(0, 4)), Map(Grid((4, 4)), {0: 0}, replicate=[1]))
     tx, ty = coord("tx"), coord("ty")
     key = air_backend.slice_key(v, (tx, ty))
     assert key_forms(key) == [(({"tx": 25}, 0), ({"tx": 25}, 25))]
 
 
 def test_full_replication_is_constant_region():
-    v = bind(FakeBuffer("l2", 100), Decomposition(), Replicate(Grid((4, 4))))
+    v = bind(VirtualBuffer("l2", 100), Decomposition(), Replicate(Grid((4, 4))))
     key = air_backend.slice_key(v, (coord("tx"), coord("ty")))
     assert key_forms(key) == [(({}, 0), ({}, 100))]
 
 
 def test_2d_block():
-    v = bind(FakeBuffer("l2", 16, 32), Decomposition(Block(0, 2), Block(1, 2)), Map(Grid((2, 2)), {0: 0, 1: 1}))
+    v = bind(VirtualBuffer("l2", 16, 32), Decomposition(Block(0, 2), Block(1, 2)), Map(Grid((2, 2)), {0: 0, 1: 1}))
     key = air_backend.slice_key(v, (coord("tx"), coord("ty")))
     assert key_forms(key) == [(({"tx": 8}, 0), ({"tx": 8}, 8)), (({"ty": 16}, 0), ({"ty": 16}, 16))]
 
 
 def test_partial_source_subtracts_origin():
     # the handle holds global [50, 100); only PEs 2 and 3 of the view live in it
-    src = DataSource(FakeBuffer("piece", 50), global_shape=(100,), origin=(50,))
+    src = DataSource(VirtualBuffer("piece", 50), global_shape=(100,), origin=(50,))
     v = bind(src, Decomposition(Block(0, 4)), Map(Grid(4), {0: 0}))
     with pytest.raises(ValueError, match="source window"):
         air_backend.slice_key(v, (coord("tx"),))      # PEs 0, 1 fall outside the handle
     # the offset formula itself carries -origin
-    full = DataSource(FakeBuffer("whole", 100), global_shape=(100,))
+    full = DataSource(VirtualBuffer("whole", 100), global_shape=(100,))
     assert air_backend.offsets(bind(full, Decomposition(Block(0, 4)), Map(Grid(4), {0: 0})), (3,)) == (75,)
     assert v.source_region(v.held_region(3)).offset == (25,)
 
 
 def test_int_coords_give_concrete_slices():
-    v = bind(FakeBuffer("l2", 100), Decomposition(Block(0, 4)), Map(Grid(4), {0: 0}))
+    v = bind(VirtualBuffer("l2", 100), Decomposition(Block(0, 4)), Map(Grid(4), {0: 0}))
     assert air_backend.slice_key(v, (2,)) == (slice(50, 75),)
 
 
 def test_uneven_is_refused_with_a_reason():
-    v = bind(FakeBuffer("l2", 99), Decomposition(UnevenBlock(0, parts=4)), Map(Grid(4), {0: 0}))
+    v = bind(VirtualBuffer("l2", 99), Decomposition(UnevenBlock(0, parts=4)), Map(Grid(4), {0: 0}))
     with pytest.raises(NotImplementedError, match="uneven"):
         air_backend.slice_key(v, (0,))
