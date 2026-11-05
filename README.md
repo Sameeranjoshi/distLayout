@@ -187,6 +187,16 @@ The tests check the result against a dense product for block, random, BFS, renum
 
 `ghost_gather_kernel(sched, n)` is a complete, checkable kernel: `Y[p] == x[local_ids(p)]`. On the scrambled mesh, renumbering cuts the gather from 84 DMAs to 39, with each PE's owned part becoming one 16-element DMA. The rest are single-element ghost runs, the real cost of irregular data on a DMA machine.
 
+### PartTensor-style rectangle partitions
+
+A sparse matrix cut into disjoint, non-uniform rectangles, one per PE, is `Decomposition(UnevenBlock(0, sizes=...), UnevenBlock(1, sizes=...))` with a `Map`.
+
+`rectangle_fetch(view, pattern)` gives, for each PE:
+- how many nonzeros of its row band are local;
+- which foreign rectangle slices it must fetch, one `(owner, Box, nnz)` per owner.
+
+That's the decision a PartTensor `get_slice` makes. It's checked against brute force on random rectangle layouts. The explorer preset *PartTensor-style rectangles* shows a 10 × 7 example. AIR emission of these slices is not implemented: the layout is uneven in 2-D.
+
 ## Visualize
 
 ```bash
@@ -195,7 +205,7 @@ python3 examples/gallery.py          # writes docs/explorer.html, open it in a b
 
 `docs/explorer.html` is one self-contained page with no network or dependencies:
 
-- **Presets:** Block, Block + replicate, Uneven, Replicate, 2-D block, Transposed mapping, 2-D halo, Cyclic, Block-cyclic, Skew, Tile split, Rank split k=1 / k=4, Refine 1-D, Irregular: block of ids / BFS partition / renumbered (with a ④ graph view of the mesh), eltwise_add.
+- **Presets:** Block, Block + replicate, Uneven, Replicate, 2-D block, Transposed mapping, 2-D halo, Cyclic, Block-cyclic, Skew, Tile split, Rank split k=1 / k=4, Refine 1-D, Irregular: block of ids / BFS partition / renumbered (with a ④ graph view of the mesh), PartTensor-style rectangles, eltwise_add.
 - **Builder,** in the library's two steps: *① Cut*, per tensor axis whole / block / uneven and a piece count; *③ Map*, per grid axis an owner expression such as `t0`, `t0 mod 4` or `(t0 + t1) mod 4` (blank = replicated). Halo radius, bytes per element and PE memory are also editable, and errors are explained inline.
 - **Picture, in three steps:** ① *Decompose*: a neutral cutter, the tensor's outline with dashed cut lines and piece names (`P2`, `P(1,0)`), no PEs yet. ② *Cut the tensor*: the same dashed cuts over the elements, each piece in its own color; hover an element for its formula (`p0 = i0 // 8 … → piece P(1,0) → PE 1`). ③ *Map pieces to PEs*: each card says which piece it got (`PE 1 ← P(1,0)`), with a memory-fit bar against the PE budget and red arrows for halo imports. The *Transposed mapping* preset uses the same cuts as *2-D block* but a different mapping.
 - **Code tabs:** Python spec · `#dist.layout` · `air.api` herd body · MLIR (the real module, when rendered with MLIR-AIR installed).

@@ -16,6 +16,7 @@ import random  # noqa: E402
 from distlayout import (Block, Decomposition, Grid, Map, OwnerMap, Replicate, UnevenBlock, bind,  # noqa: E402
                         bfs_partition, block_cyclic, block_partition, cyclic, grid_graph, owner_array, refine,
                         renumber, skew)
+from distlayout.irregular import CSRPattern  # noqa: E402
 from distlayout.irregular import grid_positions  # noqa: E402
 from distlayout.viz import render_explorer  # noqa: E402
 
@@ -39,9 +40,31 @@ def eltwise_mlir(n, tile):
         return None
 
 
+def _rect_rows():
+    """A fixed sparse 10 x 7 pattern (seeded), with the diagonal present."""
+    rng = random.Random(4)
+    return [sorted({c for c in range(7) if rng.random() < 0.35} | ({i} if i < 7 else set())) for i in range(10)]
+
+
+def _rect_summary(view, pattern):
+    from distlayout import rectangle_fetch
+    fx = rectangle_fetch(view, pattern)
+    parts = []
+    for pe, d in fx.items():
+        src = sorted({s for s, _, _ in d["fetch"]})
+        parts.append(f"PE {pe[0] * 2 + pe[1]}: {d['local_nnz']} local, "
+                     + (f"fetches {len(d['fetch'])} slice(s) from PE {', '.join(str(s[0] * 2 + s[1]) for s in src)}"
+                        if d["fetch"] else "no fetch"))
+    return "; ".join(parts) + "."
+
+
 def presets():
     g41 = Grid((4, 1))
     rank_view = bind(Buf(8, 4096), Decomposition(Block(0, 8)), Map(Grid(8), {0: 0}))
+    rect_view = bind(Buf(10, 7), Decomposition(UnevenBlock(0, sizes=[3, 7]), UnevenBlock(1, sizes=[2, 5])),
+                     Map(Grid((2, 2)), {0: 0, 1: 1}))
+    rect_pattern = CSRPattern.from_rows(_rect_rows(), ncols=7)
+    rect_note = _rect_summary(rect_view, rect_pattern)
     scramble = list(range(64))
     random.Random(1).shuffle(scramble)
     mesh, mesh_pos = grid_graph(8, 8, scramble), grid_positions(8, 8, scramble)
@@ -96,6 +119,10 @@ def presets():
          {"pattern": renum_mesh, "positions": renum_pos,
           "note": "renumber(owner) permutes ids so each PE's are contiguous: the owner table becomes a placement "
                   "(an uneven block, emittable to AIR) with the same ghosts as the BFS partition."}),
+        ("PartTensor-style rectangles", rect_view,
+         {"note": "A sparse 10 × 7 matrix cut into uneven disjoint rectangles (rows 3 + 7, columns 2 + 5), one per PE. "
+                  "PE 0 computes the rows of its rectangles and needs the nonzeros of those rows: " + rect_note + " "
+                  "Each foreign slice is one fetch, like a PartTensor get_slice."}),
         ("eltwise_add", bind(Buf(n), Decomposition(Block(0, n // tile)), Map(Grid(n // tile), {0: 0})),
          {"src": "l2_a", "mlir": eltwise_mlir(n, tile),
           "note": f"Upstream eltwise_add_with_l2, n = {n}, tile = {tile}: one block per herd point. The MLIR tab "

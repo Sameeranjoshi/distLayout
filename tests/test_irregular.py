@@ -183,3 +183,74 @@ def test_rectangular_spmv_with_its_own_x_layout():
     sched = inspect(rows, pat, xv)
     y = spmv(sched, pat, values, scatter(xv, x))
     assert y[(0,)] + y[(1,)] == pytest.approx(dense_spmv(pat, values, x))
+
+
+# -- rectangle partitions + sparse pattern (PartTensor-style) -------------------------
+
+from distlayout import Box, UnevenBlock, rectangle_fetch  # noqa: E402
+
+
+def _rect_brute(view, pattern, pe):
+    """Brute force: for each nonzero of the PE's row band, which owner rectangle holds it."""
+    owner_of = {}
+    for pid in view.partitions():
+        box = view.partition_region(pid)
+        for i in box.indices():
+            owner_of[i] = view.mapping.pes_of(pid)[0]
+    band_rows = {i for r in view.held_regions(pe) for i in range(r.offset[0], r.stop[0])}
+    local, foreign = 0, {}
+    for i in band_rows:
+        for c in pattern.row(i):
+            src = owner_of[(i, c)]
+            if src == pe:
+                local += 1
+            else:
+                foreign[src] = foreign.get(src, 0) + 1
+    return local, foreign
+
+
+def test_rectangle_fetch_hand_example():
+    v = bind(Buf(10, 7), Decomposition(UnevenBlock(0, sizes=[3, 7]), UnevenBlock(1, sizes=[2, 5])),
+             Map(Grid((2, 2)), {0: 0, 1: 1}))
+    # row 0 has nonzeros in both column bands; row 5 only in the right band
+    pat = CSRPattern.from_rows([[0, 4], [1], [2], [], [6], [3, 6]] + [[]] * 4, ncols=7)
+    got = rectangle_fetch(v, pat)
+    # PE (0,0) computes rows 0..2 of its rectangle [0:3, 0:2): nonzeros (0,0), (1,1) are local;
+    # (0,4) and (2,2) lie in the right rectangle [0:3, 2:7), owned by PE (0,1): one slice, 2 nonzeros.
+    assert got[(0, 0)]["local_nnz"] == 2
+    assert got[(0, 0)]["fetch"] == [((0, 1), Box((0, 2), (3, 5)), 2)]
+    # PE (1,1) computes rows 3..9 of [3:10, 2:7): (5,3) and (5,6) and (4,6) are local; nothing foreign.
+    assert got[(1, 1)]["local_nnz"] == 3 and got[(1, 1)]["fetch"] == []
+
+
+def test_rectangle_fetch_matches_brute_force_on_random_rectangles():
+    import random as _r
+    checked = 0
+    for seed in range(40):
+        rng = _r.Random(seed)
+        R, C = rng.randint(4, 14), rng.randint(4, 14)
+        pr, pc = rng.randint(1, min(3, R)), rng.randint(1, min(3, C))
+        def cuts(n, k):
+            edges = sorted(rng.sample(range(1, n), k - 1)) if k > 1 else []
+            e = [0] + edges + [n]
+            return [b - a for a, b in zip(e, e[1:])]
+        v = bind(Buf(R, C), Decomposition(UnevenBlock(0, sizes=cuts(R, pr)), UnevenBlock(1, sizes=cuts(C, pc))),
+                 Map(Grid((pr, pc)), {0: 0, 1: 1}))
+        rows = [sorted({c for c in range(C) if rng.random() < 0.3}) for _ in range(R)]
+        pat = CSRPattern.from_rows(rows, ncols=C)
+        got = rectangle_fetch(v, pat)
+        for pe in v.grid.coords():
+            local, foreign = _rect_brute(v, pat, pe)
+            assert got[pe]["local_nnz"] == local, (seed, pe)
+            assert {src: n for src, _, n in got[pe]["fetch"]} == foreign, (seed, pe)
+            for src, box, n in got[pe]["fetch"]:          # every fetched slice really lies in its owner's rectangle
+                assert v.partition_region(v.partition_of(box.offset)).contains_box(box)
+                assert box.intersect(v.held_regions(pe)[0]) is None if v.held_regions(pe) else True
+        checked += 1
+    assert checked == 40
+
+
+def test_rectangle_fetch_rejects_mismatched_shapes():
+    v = bind(Buf(4, 4), Decomposition(Block(0, 2), Block(1, 2)), Map(Grid((2, 2)), {0: 0, 1: 1}))
+    with pytest.raises(ValueError):
+        rectangle_fetch(v, CSRPattern.from_rows([[0]] * 3, ncols=4))

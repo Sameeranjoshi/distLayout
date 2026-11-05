@@ -36,6 +36,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from .decomposition import Decomposition, UnevenBlock
 from .mapping import Grid, TableMap
 from .region import IndexSet
+from .region import Box
 from .view import DistributedView
 
 
@@ -352,3 +353,48 @@ def spmv(sched: GhostSchedule, pattern: CSRPattern, values: Sequence[float],
         y[pe] = [sum(vals[k] * xl[local.colidx[k]] for k in range(local.rowptr[r], local.rowptr[r + 1]))
                  for r in range(local.nrows)]
     return y
+
+
+# -- rectangle partitions with a sparse pattern (PartTensor-style) ----------------------
+
+def rectangle_fetch(view: DistributedView, pattern: CSRPattern) -> Dict[Tuple[int, ...], dict]:
+    """Which rectangles each PE must fetch so it can see every nonzero of its row band.
+
+    ``view`` cuts a 2-D tensor (the sparse matrix) into disjoint rectangles, each
+    owned by one PE; ``pattern`` gives the nonzeros. A PE computes the rows of its
+    own rectangles, so it needs the nonzeros of those rows, wherever they live.
+    Returns, per PE::
+
+        {"local_nnz": int,                       # nonzeros of its band inside its own rectangles
+         "fetch": [(owner_pe, Box, nnz), ...]}   # foreign rectangle slices holding nonzeros, one per owner
+
+    This is the 2-D counterpart of :func:`inspect`: PartTensor's ``get_slice``
+    decides which blocks to move, and this decides which slices.
+    """
+    if len(view.shape) != 2 or tuple(view.shape) != (pattern.nrows, pattern.ncols):
+        raise ValueError(f"view shape {tuple(view.shape)} does not match the pattern "
+                         f"({pattern.nrows} x {pattern.ncols})")
+    owners = [(view.partition_region(pid), view.mapping.pes_of(pid)[0]) for pid in view.partitions()]
+
+    def nnz_in(box: Box) -> int:
+        return sum(1 for i in range(box.offset[0], box.stop[0])
+                   for c in pattern.row(i) if box.offset[1] <= c < box.stop[1])
+
+    out: Dict[Tuple[int, ...], dict] = {}
+    for pe in view.grid.coords():
+        local, fetch = 0, []
+        for band in view.held_regions(pe):
+            slab = Box.from_bounds((band.offset[0], 0), (band.stop[0], pattern.ncols))
+            for box, src in owners:
+                part = slab.intersect(box)
+                if part is None:
+                    continue
+                n = nnz_in(part)
+                if not n:
+                    continue
+                if src == pe:
+                    local += n
+                else:
+                    fetch.append((src, part, n))
+        out[pe] = {"local_nnz": local, "fetch": fetch}
+    return out

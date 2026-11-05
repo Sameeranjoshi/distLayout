@@ -630,7 +630,7 @@ function draw(L){
   else Object.values(pair).forEach(({a,b,n,dirs})=>{const [x1,y1]=pos[a],[x2,y2]=pos[b],dx=x2-x1,dy=y2-y1;
     const [sx,sy]=edge(x1,y1,dx,dy),[ex,ey]=edge(x2,y2,-dx,-dy),diag=Math.abs(dx)>1&&Math.abs(dy)>1;
     arrows+=`<line x1="${sx}" y1="${sy}" x2="${ex}" y2="${ey}" stroke="#D95455" stroke-width="${diag?1.2:2.2}" ${diag?'stroke-dasharray="4 3"':""} ${dirs.has("ab")?'marker-end="url(#ah)"':""} ${dirs.has("ba")?'marker-start="url(#ah2)"':""}><title>PE ${a} ⇄ PE ${b}: ${n} ${halo?"halo":"ghost"} elements</title></line>`});
-  let H=py+gr*(bh+bg)+4+arcDepth, PW=Math.max(X0+tw,gc*(bw+bg),TW);
+  let H=py+gr*(bh+bg)+4+arcDepth, PW=Math.max(X0+tw,X0+330,gc*(bw+bg),TW);   // room for the captions
   // ④ graph view: mesh nodes at their positions, colored by owner; cut edges dashed red
   const gv=L.spec.graph;
   if(gv&&rank===1){const P=gv.pos,mx=Math.max(...P.map(p=>p[0])),my=Math.max(...P.map(p=>p[1])),sp=Math.max(14,Math.min(34,Math.floor((W-20)/(my+1)))),gy=H+46;
