@@ -47,6 +47,25 @@ with air.herd(air_backend.herd_space(view), shape=(2,)) as h:
 - `examples/demo.py` prints the five design cases. It needs no AIR.
 - `examples/eltwise_add_with_l2_dist.py` is upstream's `eltwise_add_with_l2` with the layout supplying every L2↔L1 window.
 
+## Visualize
+
+```bash
+python3 examples/gallery.py          # writes docs/gallery/*.html, open docs/gallery/index.html
+```
+
+`distlayout.viz.render_html(view, requests={pe: Box}, mlir=text)` turns any view into one self-contained HTML page. It needs no network or dependencies, and the panels are linked: hover an element to light up every PE holding it, or a PE to light up its region.
+
+| Panel | Shows |
+|---|---|
+| 01 Input | the logical tensor, each element colored by its primary owner |
+| 02 Mapping | the PE grid: each PE's region, with primary vs replica (striped) |
+| 03 Local views | each PE's local buffer; with `requests=`, owned cells vs `g` ghost cells and where each ghost comes from |
+| 04 Layout | the Python spec (`spec_code`) and the `#dist.layout` text |
+| 05 Generated code | the `air.api` herd body with the derived affine window, plus a per-PE table of the region each reads |
+| 06 MLIR | the real module from `air.api`, when MLIR-AIR is installed |
+
+Gallery cases: block, block + replication, uneven, full replication, 2-D block, 2-D halo, 1-D halo plan, and upstream `eltwise_add_with_l2`.
+
 ## Tests
 
 ```bash
