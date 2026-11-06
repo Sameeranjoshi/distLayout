@@ -24,13 +24,15 @@ From a `DistributedView` you can ask ownership questions, plan transfers for a r
 | `distlayout/expr.py` | quasi-affine expressions: `+ - *const floordiv mod`, `parse`, MLIR-syntax printing, `substitute` |
 | `distlayout/view.py` | `DataSource`, `DistributedView` (ownership queries, `plan`, `validate`, `to_attr`), `bind` |
 | `distlayout/layouts.py` | `cyclic`, `block_cyclic`, `skew`, `refine` (rank splitting: owner(tx, ty)) |
-| `distlayout/irregular.py` | `CSRPattern`, `grid_graph`, `owner_array`, partitioners (`block_partition`, `random_partition`, `bfs_partition`), `renumber`, `inspect` (inspector), `scatter` / `exchange` / `spmv` / `gather` (reference executor) |
+| `distlayout/irregular.py` | `CSRPattern`, `grid_graph`, `owner_array`, partitioners (`block_partition`, `random_partition`, `bfs_partition`), `renumber`, `inspect` (inspector), `rectangle_fetch`, `scatter` / `exchange` / `spmv` / `gather` (reference executor) |
 | `distlayout/backends/schedule.py` | owner-map inversion: `solve(view)` gives loop nest + recipes; `Text` for printing; per-trip guards and guarded scans |
 | `distlayout/backends/air.py` | AIR emission: `copy_kernel`, `for_each_piece`, `for_each_region` / `halo_load` / `store_owned` (size classes), `ghost_load` / `ghost_gather_kernel`, `herd_space`, `region_shape` |
 | `distlayout/viz.py` | self-contained HTML explorer (`render_explorer`, `render_html`, `to_spec`); a JavaScript port of the algebra |
 | `examples/gallery.py` | builds `docs/explorer.html` from presets; embeds real MLIR when `air.api` is importable |
 | `examples/eltwise_add_with_l2_dist.py` | upstream's `eltwise_add_with_l2` with the layout supplying every window (byte-identical MLIR) |
 | `tests/` | see Testing |
+| `docs/FEATURES.md` | the overall feature list |
+| `docs/ML_PATTERNS.md` | study of ML data partitioning. Learn from it, but keep our own design and names. |
 
 ## Key invariants (keep these true)
 
@@ -45,15 +47,16 @@ From a `DistributedView` you can ask ownership questions, plan transfers for a r
 ## Environment and how to run things
 
 - Python 3.13 with the stdlib plus `pytest` (installed with `pip install pytest`). The core needs nothing else.
-- MLIR-AIR's Python package is optional. It was verified with the prebuilt wheel `mlir_air-0.0.1.2026100604+94f274f-cp313-cp313-linux_x86_64.whl` from `https://github.com/Xilinx/mlir-air/releases/download/latest-air-wheels/` (install with `--no-deps`, then `numpy ml_dtypes filelock==3.13.1`). Tests that need it skip cleanly without it.
+- MLIR-AIR's Python package is optional, and tests that need it skip cleanly without it. Wheels come from `https://github.com/Xilinx/mlir-air/releases/download/latest-air-wheels/` (install with `--no-deps`, then `numpy ml_dtypes filelock==3.13.1`). The release keeps about a month of nightlies, so a pinned name goes stale; first verified with `94f274f`.
+- On CHPC (Rocky 8, glibc 2.28) the wheels don't load, because they need glibc 2.32. Use the local build instead: `PYTHONPATH=~/other/spatialAIR/mlir-air/build/python MLIR_AIR_SRC=~/other/spatialAIR/mlir-air ~/work/venv_work/bin/python3 -m pytest -q`. Run on a compute node, not a login node.
 - Node plus Playwright (Chromium is preinstalled in the session container) is needed for the explorer test. Use `NODE_PATH=$(npm root -g)` if `require('playwright')` does not resolve.
-- Do not run `playwright install`; use the preinstalled browser.
+- Do not run `playwright install` in the session container; use the preinstalled browser. Elsewhere, install it in a temporary directory and point `NODE_PATH` at its `node_modules`.
 
 Commands:
 
 ```bash
-python3 -m pytest -q                      # core only: ~1,590 pass, ~230 skip
-<venv>/bin/python -m pytest -q            # with MLIR-AIR: ~1,630 pass, ~210 skip
+python3 -m pytest -q                      # core only
+<venv>/bin/python -m pytest -q            # with MLIR-AIR
 python3 examples/gallery.py               # regenerates docs/explorer.html (run with the venv to embed MLIR)
 python3 examples/demo.py                  # prints the five design cases
 ```
@@ -77,20 +80,9 @@ The combination suite, `combos.py` and `test_combinations.py`:
 
 When a combination test fails, first decide which side is wrong. Two of the bugs found so far were in the oracle or the expected text, not in the code.
 
-## Coverage (short; the README has the full table)
+## Coverage
 
-| Area | Core | Explorer | AIR |
-|---|---|---|---|
-| Block, replicate | yes | yes | yes (eltwise byte-identical) |
-| Uneven, halo (1-D/2-D, any boundary) | yes | yes | yes, size-class branches |
-| Cyclic, block-cyclic, skew, tile split, refine | yes | yes | yes |
-| Same coordinate on two axes, gcd(a,P)>1, non-linear | yes | yes | yes (guard / guarded scan) |
-| Owner maps with uneven tiles, halo on owner maps | yes | yes | **no, refused with a reason** |
-| 3-D PE grids | yes | yes | **no** (`air.api` herds are 1-D or 2-D) |
-| Owner arrays, CSR, inspector, executor | yes | yes | ghost gather yes; executor is data movement only |
-| Redistribution between layouts | **no** | no | no |
-| Native MLIR attribute / op | text only (`to_attr`) | no | no |
-| All-reduce, all-to-all | on hold (compute-side collectives) | — | — |
+`docs/FEATURES.md` is the one feature list. Update it in the same commit as any feature, and show it to the user at each milestone.
 
 Nothing has been compiled or run on an NPU. "AIR yes" means the module is generated by the real `air.api` and checked structurally.
 

@@ -80,30 +80,7 @@ Where distlayout is behind: no native MLIR dialect yet, and nothing has run on h
 
 ## Coverage
 
-| Category | Feature | Core (Python) | Explorer | AIR backend |
-|---|---|---|---|---|
-| 1. Structured sharding | Block | ✅ | ✅ | ✅ byte-identical to upstream eltwise_add |
-| | Uneven block | ✅ | ✅ | ✅ one `air.ops.branch` per size class, L1 tile at the largest size |
-| | Replication | ✅ | ✅ | ✅ |
-| | Rectangular halo (`plan`) | ✅ | ✅ | ✅ `halo_load` / `store_owned`: read from L2, zeros outside the tensor (core fill, DMA pad or clip) |
-| | All-reduce, all-to-all | ⏸ on hold (compute-side collectives) | | |
-| 2. Affine owner maps | `OwnerMap` + quasi-affine `expr` (`+ - *const floordiv mod`) | ✅ | ✅ | ✅ via owner-map inversion (`backends/schedule.py`) |
-| | Cyclic, block-cyclic, skew, tile split | ✅ | ✅ | ✅ `air.sequential` loops over each PE's pieces; built with real `air.api` |
-| | Several pieces per PE (local `(slot, *tile)`) | ✅ | ✅ | ✅ `for_each_piece`, `load_local` / `store_local` |
-| | Rank splitting `refine(view, axis, k)` → `owner(tx, ty)` | ✅ | ✅ | ✅ |
-| | Coefficients invertible mod P (modular inverse); pieces not dividing evenly over PEs (uniform trips + per-trip guard) | ✅ | ✅ | ✅ |
-| | Same coordinate on several grid axes; coefficients with gcd(a, P) > 1; non-linear owner expressions | ✅ | ✅ | ✅ per-trip consistency guard (`expr == x`), guarded scan of the free coordinates |
-| | Owner maps with halo or uneven tiles; 3-D PE grids | ✅ | ✅ | ❌ refused with a reason (size classes inside the piece loop; `air.api` herds are 1-D / 2-D) |
-| 3. Irregular | Owner arrays (`owner_array` → runs + `TableMap`) | ✅ | ✅ | ✅ owned + ghost x via `ghost_load`, any table; renumbered tables also as an uneven block |
-| | Sparse access pattern (`CSRPattern`; graphs as adjacency) | ✅ | ✅ graph view, cut edges | — |
-| | Inspector: owned / ghost sets, import & export lists, local CSR (`inspect`) | ✅ | ✅ ghost counts, import arcs | ✅ `ghost_load`: one branch per PE, one static DMA per id run from L2 |
-| | Partitioners: block, random, BFS graph growing; `renumber` | ✅ | ✅ | — |
-| | Executor: `scatter` / `exchange` (along export lists) / `spmv` (local CSR) / `gather` | ✅ checked against dense `A @ x` | — | data movement only (no sparse compute in `air.api`) |
-| | Patterns that change at run time (run-time inspector) | ❌ | ❌ | ❌ |
-| Transitions | `redistribute`, `plan_redistribution` | ❌ | ❌ | ❌ |
-| Native MLIR | `#dist.layout` attribute, `dist.bind` op | text only (`to_attr`) | | |
-
-AIR emission is checked by building kernels with the real `air.api` (`tests/test_air_real.py`). Nothing has been compiled for or run on an NPU yet.
+The overall feature list, with what's done and what isn't, is in [`docs/FEATURES.md`](docs/FEATURES.md).
 
 ## Owner maps (category 2)
 
@@ -286,14 +263,4 @@ pip install --no-deps mlir_air-0.0.1.2026100604+94f274f-cp313-cp313-linux_x86_64
 
 ## Status and limits
 
-- **Checked against real `air.api` up to the emitted MLIR, not yet compiled or run on an NPU.** That needs the `[aie]` extra and hardware/XRT.
-- **The AIR backend emits uniform layouts only.** `air.api` needs one static transfer size, and uneven layouts give PEs different sizes. `plan()` describes them exactly. Emitting them needs `air.ops.branch` or a padded L2 source.
-- **One partition per PE along each placed axis.** Cyclic layouts and overdecomposition come later.
-- **The partial-source binding works only within its window.** A `DataSource` with `origin` gives correct offsets for PEs whose region lies in the window. Decomposing *the window itself* (an MPI rank's piece split k ways) is the next feature, needed for rank splitting.
-
-## Roadmap
-
-1. **V1:** uneven emission, `Cyclic`/`BlockCyclic`, halo requests to AIR transfers.
-2. **V2:** `redistribute(view, layout)` with a "no movement needed" check.
-3. **V3:** a `#dist.layout` attribute and `dist.bind` op in MLIR (`to_attr()` is the textual sketch), consumed by the MPI→AIR rank-split pass.
-4. **Later:** irregular `IndexMap` ownership, and LEGO for layout inside a PE.
+Checked against real `air.api` up to the emitted MLIR, but not yet compiled or run on an NPU. That needs the `[aie]` extra and hardware/XRT. See [`docs/FEATURES.md`](docs/FEATURES.md) for what comes next.
