@@ -18,7 +18,7 @@ maps accept: ``+``, ``-``, multiplication by a constant, and ``floordiv`` /
 from __future__ import annotations
 
 import re
-from typing import Sequence, Union
+from typing import Dict, Sequence, Union
 
 Number = int
 
@@ -279,16 +279,21 @@ def parse(text: Union[str, Expr]) -> Expr:
 
 def substitute(e: Expr, k: int, repl: Expr) -> Expr:
     """``e`` with every ``t{k}`` replaced by ``repl``."""
+    return substitute_all(e, {k: repl})
+
+
+def substitute_all(e: Expr, repl: Dict[int, Expr]) -> Expr:
+    """``e`` with each ``t{k}`` replaced by ``repl[k]``, all at once (so a swap of two variables works)."""
     if isinstance(e, Var):
-        return repl if e.k == k else e
+        return repl.get(e.k, e)
     if isinstance(e, Const):
         return e
     if isinstance(e, Add):
-        return Add(substitute(e.a, k, repl), substitute(e.b, k, repl))
+        return Add(substitute_all(e.a, repl), substitute_all(e.b, repl))
     if isinstance(e, Mul):
-        return Mul(substitute(e.a, k, repl), e.k)
+        return Mul(substitute_all(e.a, repl), e.k)
     if isinstance(e, FloorDiv):
-        return FloorDiv(substitute(e.a, k, repl), e.k)
+        return FloorDiv(substitute_all(e.a, repl), e.k)
     if isinstance(e, Mod):
-        return Mod(substitute(e.a, k, repl), e.k)
+        return Mod(substitute_all(e.a, repl), e.k)
     raise TypeError(f"unknown expression {e!r}")

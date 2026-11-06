@@ -48,7 +48,8 @@ Where distlayout stands overall. This is the one list to keep current: update it
 
 | Feature | Core | Explorer | AIR |
 |---|---|---|---|
-| Any layout inside any layout | ❌ | ❌ | ❌ |
+| Any layout inside any layout (`nest`) | ✅ | ✅ | ✅ when the result is an emittable owner map |
+| An inner layout across a PE's whole stack of pieces | ⚠️ write the owner map by hand | ✅ | ✅ |
 | Several tensors assigned together (whole tensors as pieces) | ❌ | ❌ | ❌ |
 | Layout inside one PE (tiling, swizzle) | ❌ | ❌ | ❌ |
 

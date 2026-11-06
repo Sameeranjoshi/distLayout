@@ -21,6 +21,7 @@ DistributedView + herd coordinates     --air -->  air.alloc / air.ops.load / sto
 | `mapping` | `Grid(shape)`, `Map(grid, {component: grid_axis}, replicate=[axes])`, `Replicate(grid)` |
 | `view` | `DataSource(handle, global_shape, origin=, extent=)`, `bind(...)` → `DistributedView` |
 | `DistributedView` | `primary_owner`, `holders`, `held_region`, `owned_region`, `local_shape`, `max_local_shape`, `local_index`, `global_index`, `is_local`, `source_region`, `plan(pe, request)`, `validate()`, `table()`, `to_attr()` |
+| `layouts` | `cyclic`, `block_cyclic`, `skew`, `nest`, `refine` |
 | `backends.air` | `offsets`, `slice_key`, `local_region`, `alloc_local`, `load_local`, `store_local`, `herd_space` |
 
 Semantics that v0 enforces:
@@ -99,6 +100,27 @@ refine(rank_view, axis=0, k=2)             # owner = [g0 = t0 floordiv 2, g1 = t
 - Expressions use MLIR's quasi-affine language and print in its syntax (`(t0 floordiv 2) mod 4`).
 - Grid axes without an expression are replicated, and must be listed in `replicate=`.
 - When a PE holds several pieces, every local buffer is a stack of tiles, `(slot, *tile)`. With tiles of different sizes it is flat.
+
+### Layouts inside layouts
+
+`nest(view, decomposition, mapping)` lays a whole layout out inside every piece of `view`, on a new grid:
+
+```python
+ranks = bind(x, Decomposition(Block(0, 4)), Map(Grid(4), {0: 0}))     # 4 ranks of 12 elements
+nest(ranks, *cyclic(12, 3))                                           # each rank deals its 12 over 3 cores
+nest(ranks, Decomposition(), Replicate(Grid(3)))                      # each rank copies its piece to 3 cores
+nest(bind(y, *owner_array(owner)), Decomposition(UnevenBlock(0, parts=2)), Map(Grid(2), {0: 0}))
+```
+
+- The inner layout is written for one piece, in the piece's own coordinates. It must fit every piece.
+- A PE of the result is `(outer PE, inner PE)`. Replication on either side stays replication.
+- The result is an ordinary view, so `plan`, `inspect`, the explorer and the AIR backend need nothing new. `nest(ranks, *cyclic(12, 3))` is `g0 = t0 floordiv 12, g1 = (t0 mod 12) mod 3`.
+- Nesting is associative, so three levels work the same way. `refine` is `nest` with one cut.
+
+Limits:
+- Each piece is split on its own. To cut across a PE's whole stack of pieces, write the owner map by hand: `{0: "t0 mod P", 1: "(t0 floordiv P) floordiv b"}`.
+- An owner table nested with a cut on another axis is refused, since `TableMap` has one piece coordinate.
+- The AIR emission of a nested map may use a guard per trip instead of a closed-form loop: correct, but not the shortest code.
 
 ### Uneven layouts and halos to AIR
 
@@ -213,7 +235,7 @@ python3 examples/gallery.py          # writes docs/explorer.html, open it in a b
 
 `docs/explorer.html` is one self-contained page with no network or dependencies:
 
-- **Presets:** Block, Block + replicate, Uneven, Replicate, 2-D block, Transposed mapping, 2-D halo, Cyclic, Block-cyclic, Skew, Tile split, Rank split k=1 / k=4, Refine 1-D, Irregular: block of ids / BFS partition / renumbered (with a ④ graph view of the mesh), PartTensor-style rectangles, eltwise_add.
+- **Presets:** Block, Block + replicate, Uneven, Replicate, 2-D block, Transposed mapping, 2-D halo, Cyclic, Block-cyclic, Skew, Tile split, Rank split k=1 / k=4, Refine 1-D, Irregular: block of ids / BFS partition / renumbered (with a ④ graph view of the mesh), PartTensor-style rectangles, four nested layouts, eltwise_add.
 - **Builder,** in the library's two steps. *① Decomposition layout*: per tensor axis whole / block / uneven, with a piece count; uneven axes also take explicit **sizes** (`3, 7`) or a **balanced / tail** policy. *③ Mapping layout*: per grid axis an owner expression such as `t0`, `t0 mod 4` or `(t0 + t1) mod 4` (blank = replicated). Also halo radius, bytes per element and PE memory, with errors explained inline (e.g. "sizes 3, 6 sum to 9, axis has 10").
 - **Picture, in three steps:** *① Decomposition layout*: an outline of the tensor drawn on the tensor's own grid, so its cuts line up with the tensor and can be laid on it mentally. *② Tensor*: the same cuts over the elements, colored by owner PE; hover an element for its formula. *③ Mapping layout*: each PE card names the piece(s) it got, with a memory-fit bar and red arrows for halo or ghost imports. Code tabs (Python, `#dist.layout`, `air.api`, MLIR) sit in a full-width panel below.
 - **Code tabs:** Python spec · `#dist.layout` · `air.api` herd body · MLIR (the real module, when rendered with MLIR-AIR installed).
@@ -228,7 +250,7 @@ For your own views, use `distlayout.viz.render_html(view, halo=1, mlir=text)` or
 - 1-D / 2-D tensors;
 - whole, block and uneven cuts (balanced, tail, explicit sizes);
 - placement, owner-map, table and replicate mappings;
-- replication, and `refine` once or twice.
+- replication, `refine` once or twice, and `nest`.
 
 The checks:
 - core invariants;

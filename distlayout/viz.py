@@ -33,7 +33,7 @@ import json
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .decomposition import Block, UnevenBlock
-from .expr import Var, substitute
+from .expr import Var, substitute_all
 from .mapping import as_placement
 from .view import DistributedView
 
@@ -298,11 +298,7 @@ def to_spec(view: DistributedView, title: str = "", note: str = "", halo: int = 
     exprs = {} if table else view.mapping.exprs()
     mapping: List[Optional[str]] = [None] * view.grid.rank
     for g, e in exprs.items():
-        for old in range(len(rules)):                      # two-phase renumbering avoids collisions
-            e = substitute(e, old, Var(1000 + new_of[old]))
-        for new in range(len(rules)):
-            e = substitute(e, 1000 + new, Var(new))
-        mapping[g] = str(e)
+        mapping[g] = str(substitute_all(e, {old: Var(new_of[old]) for old in range(len(rules))}))
     spec = {"title": title, "group": group, "note": note, "shape": list(view.shape), "grid": list(view.grid.shape),
             "cuts": cuts, "map": mapping, "halo": halo, "bytes": elem_bytes, "kib": pe_kib, "src": src}
     if table:

@@ -2,10 +2,10 @@
 
 import pytest
 
-from distlayout import (Block, Box, Decomposition, Grid, Map, OwnerMap, UnevenBlock, bind, block_cyclic,
-                        cyclic, parse, refine, skew, t)
+from distlayout import (Block, Box, Decomposition, Grid, Map, OwnerMap, Replicate, TableMap, UnevenBlock, bind,
+                        block_cyclic, cyclic, nest, owner_array, parse, refine, skew, t)
 from distlayout.backends import air as air_backend
-from distlayout.expr import substitute
+from distlayout.expr import substitute, substitute_all
 
 
 class Buf:
@@ -30,6 +30,7 @@ def test_parse_print_eval(text, printed, at, value):
 def test_operators_build_the_same_expression():
     assert (t(0) + 2 * t(1)) % 4 == parse("(t0 + t1 * 2) mod 4")
     assert substitute(t(0) % 4, 0, t(0) // 2) == parse("(t0 floordiv 2) mod 4")
+    assert substitute_all(t(0) + t(1), {0: t(1), 1: t(0)}) == parse("t1 + t0")      # at once, not in sequence
 
 
 @pytest.mark.parametrize("bad", ["t0 * t1", "t0 mod t1", "t0 +", "(t0", "x0"])
@@ -134,6 +135,83 @@ def test_refine_uneven_and_keeps_replication():
     assert [split.held_region((p, 0, s)) for p in range(2) for s in range(2)] == [
         Box((0,), (3,)), Box((3,), (3,)), Box((6,), (2,)), Box((8,), (2,))]
     assert split.holders(7) == ((1, 0, 0), (1, 1, 0)) and split.holders(8) == ((1, 0, 1), (1, 1, 1))
+
+
+# -- layouts inside layouts = nest ----------------------------------------------
+
+def test_nest_cyclic_inside_each_block():
+    ranks = bind(Buf(12), Decomposition(Block(0, 3)), Map(Grid(3), {0: 0}))     # 3 ranks of 4 elements
+    v = nest(ranks, *cyclic(4, 2))
+    v.validate()
+    assert v.grid.shape == (3, 2)
+    assert v.to_attr().endswith("owner = [g0 = t0 floordiv 4, g1 = (t0 mod 4) mod 2], replicate = []>")
+    assert v.held_regions((1, 1)) == (Box((5,), (1,)), Box((7,), (1,)))
+
+
+def test_nest_splits_every_tile_of_a_cyclic_outer_layout():
+    v = nest(bind(Buf(16), *block_cyclic(16, 4, 2)), Decomposition(Block(0, 2)), Map(Grid(2), {0: 0}))
+    v.validate()
+    assert v.held_regions((1, 1)) == (Box((6,), (2,)), Box((14,), (2,)))        # second half of tiles 1 and 3
+
+
+def test_nest_on_an_axis_the_outer_layout_left_whole():
+    outer = bind(Buf(8, 6), Decomposition(Block(1, 2)), Map(Grid(2, names=["model"]), {0: 0}))  # columns over ranks
+    v = nest(outer, Decomposition(Block(0, 4)), Map(Grid(4, names=["data"]), {0: 0}))           # rows inside each
+    v.validate()
+    assert v.primary_owner((5, 4)) == (1, 2)
+    assert v.held_region((1, 2)) == Box((4, 3), (2, 3))
+    assert v.grid.names == ("model", "data")
+
+
+def test_nest_inside_an_owner_table():
+    v = nest(bind(Buf(6), *owner_array([1, 1, 1, 1, 0, 0])),                    # runs of 4 and 2
+             Decomposition(UnevenBlock(0, parts=2)), Map(Grid(2), {0: 0}))
+    v.validate()
+    assert isinstance(v.mapping, TableMap)
+    assert [v.primary_owner(i) for i in range(6)] == [(1, 0), (1, 0), (1, 1), (1, 1), (0, 0), (0, 1)]
+
+
+def test_nest_an_owner_table_inside_blocks():
+    v = nest(bind(Buf(8), Decomposition(Block(0, 2)), Map(Grid(2), {0: 0})), *owner_array([1, 0, 0, 1]))
+    v.validate()
+    assert [v.primary_owner(i)[1] for i in range(8)] == [1, 0, 0, 1, 1, 0, 0, 1]
+    assert v.primary_owner(5) == (1, 0)
+
+
+def test_nest_replicates_inside_a_piece():
+    v = nest(bind(Buf(8), Decomposition(Block(0, 2)), Map(Grid(2), {0: 0})), Decomposition(), Replicate(Grid(3)))
+    v.validate()
+    assert v.holders(5) == ((1, 0), (1, 1), (1, 2))
+
+
+def test_nest_refuses_a_table_it_cannot_write():
+    rows = bind(Buf(6, 4), *owner_array([0, 1, 0, 1, 0, 1]))
+    with pytest.raises(NotImplementedError, match="one coordinate"):
+        nest(rows, Decomposition(Block(1, 2)), Map(Grid(2), {0: 0}))
+
+
+@pytest.mark.parametrize("inner, why", [
+    (Decomposition(Block(0, 2)), "cannot cut extent 3"),                       # 3 of the 7 elements
+    (Decomposition(UnevenBlock(0, sizes=[2, 2])), "sum to 4, axis extent is 3"),
+    (Decomposition(Block(1, 2)), "tensor has rank 1"),
+])
+def test_nest_checks_the_inner_cut_against_every_piece(inner, why):
+    outer = bind(Buf(7), Decomposition(UnevenBlock(0, sizes=[4, 3])), Map(Grid(2), {0: 0}))
+    with pytest.raises(ValueError, match=why):
+        nest(outer, inner, Map(Grid(2), {0: 0}))
+
+
+def test_nest_refuses_a_cut_whose_part_count_depends_on_the_piece():
+    class TilesOfTwo(Block):                                # as many parts as the piece has tiles
+        def num_parts(self, extent):
+            return extent // 2
+
+        def bounds(self, part, extent):
+            return part * 2, part * 2 + 2
+
+    outer = bind(Buf(10), Decomposition(UnevenBlock(0, sizes=[6, 4])), Map(Grid(2), {0: 0}))
+    with pytest.raises(NotImplementedError, match="same number of parts"):
+        nest(outer, Decomposition(TilesOfTwo(0, 1)), Map(Grid(3), {0: 0}))
 
 
 def test_air_region_api_is_placement_only():

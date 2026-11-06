@@ -12,7 +12,7 @@ from itertools import product
 from typing import List, Optional, Tuple
 
 from distlayout import (Block, Box, Decomposition, Grid, Map, OwnerMap, Replicate, TableMap, UnevenBlock, bind,
-                        refine)
+                        nest, refine)
 from distlayout.expr import Var
 
 
@@ -69,10 +69,33 @@ def random_view(rng: random.Random, allow_refine: bool = True, kinds: Optional[L
                     v = refine(v, axis=axis, k=k)
                     if rng.random() < 0.3 and v.shape[axis] >= 8:
                         v = refine(v, axis=axis, k=2)
+            if allow_refine and rng.random() < 0.25:
+                v = nest(v, *random_inner(rng, v))
             return v
         except (ValueError, NotImplementedError):
             continue
     raise RuntimeError("generator could not build a view")
+
+
+def random_inner(rng: random.Random, view) -> Tuple[Decomposition, object]:
+    """A random layout that fits inside every piece of ``view``."""
+    sizes = [view.partition_region(p).size for p in view.partitions()]
+    rules = []
+    for a in range(len(view.shape)):
+        extents = [s[a] for s in sizes]
+        if rng.random() < 0.6 and min(extents) >= 2:
+            parts = rng.randint(1, min(min(extents), 4))
+            even = all(e % parts == 0 for e in extents)
+            rules.append(Block(a, parts) if even and rng.random() < 0.7 else UnevenBlock(a, parts=parts))
+    num = tuple(r.num_parts(sizes[0][r.axis]) for r in rules)
+    rep = rng.choice([0, 0, 2])
+    if rules and rng.random() < 0.5:                        # owner map: deal the pieces round-robin
+        P = rng.randint(1, 3)
+        k = rng.randrange(len(num))
+        return Decomposition(*rules), OwnerMap(Grid((P, rep) if rep else P), {0: Var(k) % P}, replicate=[1] if rep else [])
+    gshape = num + ((rep,) if rep else ()) or (1,)          # one PE per piece
+    place = {k: k for k in range(len(num))}
+    return Decomposition(*rules), Map(Grid(gshape), place, replicate=[g for g in range(len(gshape)) if g >= len(num)])
 
 
 def _try_view(rng: random.Random, kind: str):

@@ -14,10 +14,10 @@ from itertools import product
 
 import pytest
 
-from combos import Buf, all_indices, brute_owners, pieces_by_pe, random_request, random_view
+from combos import Buf, all_indices, brute_owners, pieces_by_pe, random_inner, random_request, random_view
 from distlayout import (Block, Box, DataSource, Decomposition, Grid, IndexSet, Map, OwnerMap, TableMap, UnevenBlock,
                         bfs_partition, bind, block_cyclic, block_partition, cyclic, gather, grid_graph, inspect,
-                        owner_array, random_partition, refine, renumber, scatter, skew, spmv)
+                        nest, owner_array, random_partition, refine, renumber, scatter, skew, spmv)
 from distlayout.backends import air as air_backend
 from distlayout.backends.schedule import solve
 from distlayout.expr import Add, Const, FloorDiv, Mod, Mul, Var, parse
@@ -202,6 +202,49 @@ def test_refine_twice_equals_refine_once(seed):
 def test_refine_by_one_only_adds_an_axis(seed):
     v = random_view(random.Random(6500 + seed), allow_refine=False, kinds=["placement", "owner"])
     w = refine(v, rng_axis(seed, v), 1)
+    assert all(w.primary_owner(i) == v.primary_owner(i) + (0,) for i in all_indices(v.shape))
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_nest_owns_what_the_two_layouts_say(seed):
+    """Element i: its piece's owner, then the owner of i's position inside that piece."""
+    rng = random.Random(6700 + seed)
+    outer = random_view(rng)
+    d, m = random_inner(rng, outer)
+    table = isinstance(outer.mapping, TableMap)
+    if table and len({r.axis for r in outer.decomposition.rules + d.rules}) > 1:
+        with pytest.raises(NotImplementedError):
+            nest(outer, d, m)
+        return
+    v = nest(outer, d, m)
+    v.validate()
+    assert v.grid.shape == outer.grid.shape + m.grid.shape
+    for i in all_indices(v.shape):
+        box = outer.partition_region(outer.partition_of(i))
+        inner = bind(Buf(*box.size), d, m)
+        rel = tuple(a - o for a, o in zip(i, box.offset))
+        assert v.primary_owner(i) == outer.primary_owner(i) + inner.primary_owner(rel)
+        assert set(v.holders(i)) == {h + q for h in outer.holders(i) for q in inner.holders(rel)}
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_nest_is_associative(seed):
+    rng = random.Random(6800 + seed)
+    P, k1, k2 = rng.randint(1, 4), rng.randint(1, 3), rng.randint(1, 3)
+    tile = k1 * k2 * rng.randint(1, 3)
+    a = bind(Buf(P * tile), Decomposition(Block(0, P)), Map(Grid(P), {0: 0}))
+    b_d, b_m = cyclic(tile, k1) if rng.random() < 0.5 else (Decomposition(Block(0, k1)), Map(Grid(k1), {0: 0}))
+    b = bind(Buf(tile), b_d, b_m)
+    c_d, c_m = random_inner(rng, b)
+    bc = nest(b, c_d, c_m)
+    left, right = nest(nest(a, b_d, b_m), c_d, c_m), nest(a, bc.decomposition, bc.mapping)
+    assert all(left.holders(i) == right.holders(i) for i in all_indices(a.shape))
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_nesting_one_whole_piece_only_adds_an_axis(seed):
+    v = random_view(random.Random(6900 + seed))
+    w = nest(v, Decomposition(), Map(Grid(1), {}, replicate=[0]))
     assert all(w.primary_owner(i) == v.primary_owner(i) + (0,) for i in all_indices(v.shape))
 
 

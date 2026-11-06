@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT))
 import random  # noqa: E402
 
 from distlayout import (Block, Decomposition, Grid, Map, OwnerMap, Replicate, UnevenBlock, bind,  # noqa: E402
-                        bfs_partition, block_cyclic, block_partition, cyclic, grid_graph, owner_array, refine,
+                        bfs_partition, block_cyclic, block_partition, cyclic, grid_graph, nest, owner_array, refine,
                         renumber, skew)
 from distlayout.irregular import CSRPattern  # noqa: E402
 from distlayout.irregular import grid_positions  # noqa: E402
@@ -123,6 +123,23 @@ def presets():
          {"note": "A sparse 10 × 7 matrix cut into uneven disjoint rectangles (rows 3 + 7, columns 2 + 5), one per PE. "
                   "PE 0 computes the rows of its rectangles and needs the nonzeros of those rows: " + rect_note + " "
                   "Each foreign slice is one fetch, like a PartTensor get_slice."}),
+        ("Nested: cores inside ranks", nest(bind(Buf(24), Decomposition(Block(0, 4)), Map(Grid(4), {0: 0})), *cyclic(6, 3)),
+         {"note": "nest(view, *cyclic(6, 3)): 4 ranks hold a block each, and each rank deals its 6 elements round-robin "
+                  "over its 3 cores. The inner layout is written for one rank, in that rank's coordinates; the result "
+                  "is one owner map, g0 = t0 floordiv 6, g1 = (t0 mod 6) mod 3."}),
+        ("Nested: two levels of a model", nest(bind(Buf(6, 8), Decomposition(Block(0, 2)), Map(Grid(2), {0: 0})),
+                                               Decomposition(Block(1, 4)), Map(Grid(4), {0: 0})),
+         {"note": "Rows over 2 groups (say, data-parallel), then columns inside each group over 4 PEs (model-parallel). "
+                  "The inner cut is on an axis the outer one left whole, so it adds a coordinate."}),
+        ("Nested: replicas inside ranks", nest(bind(Buf(12), Decomposition(UnevenBlock(0, sizes=[8, 4])), Map(Grid(2), {0: 0})),
+                                               Decomposition(), Replicate(Grid(3))),
+         {"note": "Each of 2 uneven ranks keeps a copy of its piece on all 3 of its cores: replication nested inside a "
+                  "partition. The first core of each rank is the owner."}),
+        ("Nested: blocks inside a graph partition", nest(bind(Buf(64), *owner_array(renum_owner)),
+                                                         Decomposition(UnevenBlock(0, parts=2)), Map(Grid(2), {0: 0})),
+         {"pattern": renum_mesh, "positions": renum_pos,
+          "note": "A graph partition over 4 ranks, with each rank's contiguous ids split over 2 cores. The partition is "
+                  "still a table, so nesting gives a table, and ghosts come from the same inspector."}),
         ("eltwise_add", bind(Buf(n), Decomposition(Block(0, n // tile)), Map(Grid(n // tile), {0: 0})),
          {"src": "l2_a", "mlir": eltwise_mlir(n, tile),
           "note": f"Upstream eltwise_add_with_l2, n = {n}, tile = {tile}: one block per herd point. The MLIR tab "
@@ -154,6 +171,7 @@ def ghost_mlir(view, pattern):
 STRUCTURED = "1. Structured tensor sharding"
 AFFINE = "2. Structured affine owner maps"
 IRREGULAR = "3. Irregular partitions"
+NESTED = "Any of these inside another"
 GROUPS = {
     "Block": STRUCTURED, "Block + replicate": STRUCTURED, "Uneven": STRUCTURED, "Replicate": STRUCTURED,
     "2-D block": STRUCTURED, "Transposed mapping": STRUCTURED, "2-D halo": STRUCTURED, "eltwise_add": STRUCTURED,
@@ -161,6 +179,8 @@ GROUPS = {
     "Rank split k=1": AFFINE, "Rank split k=4": AFFINE, "Refine 1-D": AFFINE,
     "Irregular: block of ids": IRREGULAR, "Irregular: BFS partition": IRREGULAR,
     "Irregular: renumbered": IRREGULAR, "PartTensor-style rectangles": IRREGULAR,
+    "Nested: cores inside ranks": NESTED, "Nested: two levels of a model": NESTED,
+    "Nested: replicas inside ranks": NESTED, "Nested: blocks inside a graph partition": NESTED,
 }
 
 
