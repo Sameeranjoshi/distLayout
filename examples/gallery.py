@@ -151,6 +151,19 @@ def ghost_mlir(view, pattern):
         return None
 
 
+STRUCTURED = "1. Structured tensor sharding"
+AFFINE = "2. Structured affine owner maps"
+IRREGULAR = "3. Irregular partitions"
+GROUPS = {
+    "Block": STRUCTURED, "Block + replicate": STRUCTURED, "Uneven": STRUCTURED, "Replicate": STRUCTURED,
+    "2-D block": STRUCTURED, "Transposed mapping": STRUCTURED, "2-D halo": STRUCTURED, "eltwise_add": STRUCTURED,
+    "Cyclic": AFFINE, "Block-cyclic": AFFINE, "Skew": AFFINE, "Tile split": AFFINE,
+    "Rank split k=1": AFFINE, "Rank split k=4": AFFINE, "Refine 1-D": AFFINE,
+    "Irregular: block of ids": IRREGULAR, "Irregular: BFS partition": IRREGULAR,
+    "Irregular: renumbered": IRREGULAR, "PartTensor-style rectangles": IRREGULAR,
+}
+
+
 def main(out):
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -159,6 +172,7 @@ def main(out):
         view.validate()
         if "mlir" not in kw:
             kw["mlir"] = ghost_mlir(view, kw["pattern"]) if "pattern" in kw else copy_mlir(view, kw.get("halo", 0))
+        kw["group"] = GROUPS[name]
         entries.append((name, view, {k: v for k, v in kw.items() if v is not None}))
     out.write_text(render_explorer(entries))
     print(f"  wrote {out}")

@@ -266,7 +266,8 @@ def _traced_code(view: DistributedView, names: List[str], src: str, dtype: str, 
 
 def to_spec(view: DistributedView, title: str = "", note: str = "", halo: int = 0,
             mlir: Optional[str] = None, src: str = "l2", elem_bytes: int = 4,
-            pe_kib: float = 48, pattern: Any = None, positions: Optional[Sequence[Tuple[int, int]]] = None) -> Dict[str, Any]:
+            pe_kib: float = 48, pattern: Any = None, positions: Optional[Sequence[Tuple[int, int]]] = None,
+            group: str = "") -> Dict[str, Any]:
     """The JSON the page understands. Raises for layouts the page cannot draw.
 
     Cuts are listed in tensor-axis order (as the builder shows them); owner
@@ -302,7 +303,7 @@ def to_spec(view: DistributedView, title: str = "", note: str = "", halo: int = 
         for new in range(len(rules)):
             e = substitute(e, 1000 + new, Var(new))
         mapping[g] = str(e)
-    spec = {"title": title, "note": note, "shape": list(view.shape), "grid": list(view.grid.shape),
+    spec = {"title": title, "group": group, "note": note, "shape": list(view.shape), "grid": list(view.grid.shape),
             "cuts": cuts, "map": mapping, "halo": halo, "bytes": elem_bytes, "kib": pe_kib, "src": src}
     if table:
         spec["table"], spec["rep"] = view.mapping.linear(), list(view.mapping.replicate)
@@ -356,6 +357,9 @@ h1{font-size:24px;margin:0 0 12px;font-weight:700}
 .presets button,.btn{font:inherit;font-size:13px;border:1px solid var(--line);background:var(--card);color:var(--ink);
 border-radius:8px;padding:6px 12px;cursor:pointer}
 .presets button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.presets{flex-direction:column;align-items:stretch;gap:10px}
+.pgroup{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.pgroup .lbl{font-size:13px;font-weight:600;color:var(--muted);min-width:230px}
 .main{display:grid;grid-template-columns:360px 1fr;gap:18px;align-items:start}
 @media(max-width:860px){.main{grid-template-columns:1fr}}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;min-width:0}
@@ -694,10 +698,14 @@ $("svg").onclick=()=>{const s=$("pic").querySelector("svg");if(!s)return;const c
   const v=(n,d)=>css.getPropertyValue(n).trim()||d;
   const txt=new XMLSerializer().serializeToString(s).replace(/var\(--muted\)/g,v("--muted","#52657B")).replace(/var\(--ink\)/g,v("--ink","#17253C")).replace(/var\(--bg\)/g,v("--bg","#FFFFFF"));
   const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([txt],{type:"image/svg+xml"}));a.download=(cur.title||"layout").replace(/\W+/g,"_")+".svg";a.click()};
-const P=$("presets");PRESETS.forEach((p,i)=>{const b=document.createElement("button");b.textContent=p.title||`Layout ${i+1}`;
-  b.onclick=()=>{P.querySelectorAll("button").forEach(x=>x.classList.remove("on"));b.classList.add("on");load(p)};P.appendChild(b)});
+const P=$("presets"), rowsByGroup={};
+PRESETS.forEach((p,i)=>{const g=p.group||"";let row=rowsByGroup[g];
+  if(!row){row=rowsByGroup[g]=document.createElement("div");row.className="pgroup";
+    if(g){const l=document.createElement("span");l.className="lbl";l.textContent=g;row.appendChild(l)}P.appendChild(row)}
+  const b=document.createElement("button");b.textContent=p.title||`Layout ${i+1}`;
+  b.onclick=()=>{P.querySelectorAll("button").forEach(x=>x.classList.remove("on"));b.classList.add("on");load(p)};row.appendChild(b)});
 if(PRESETS.length<2)P.style.display="none";
-P.firstChild&&P.firstChild.classList.add("on");load(PRESETS[0]);
+const first=P.querySelector("button");first&&first.classList.add("on");load(PRESETS[0]);
 window.addEventListener("resize",()=>render());
 window.distlayout={build,pyText,attrText,airText,plan,parseExpr,strE};
 </script></body></html>"""
