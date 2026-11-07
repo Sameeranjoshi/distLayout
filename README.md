@@ -22,6 +22,7 @@ DistributedView + herd coordinates     --air -->  air.alloc / air.ops.load / sto
 | `view` | `DataSource(handle, global_shape, origin=, extent=)`, `bind(...)` → `DistributedView` |
 | `DistributedView` | `primary_owner`, `holders`, `held_region`, `owned_region`, `local_shape`, `max_local_shape`, `local_index`, `global_index`, `is_local`, `source_region`, `plan(pe, request)`, `validate()`, `table()`, `to_attr()` |
 | `layouts` | `cyclic`, `block_cyclic`, `skew`, `nest`, `refine` |
+| `tree` | `Layout(cut, map, level=, inner=, overrides=)`, `bind_tree(...)` → `TreeView` (`primary_owner`, `holders`, `local_index`, `classes`, `fit`, `flatten`) |
 | `backends.air` | `offsets`, `slice_key`, `local_region`, `alloc_local`, `load_local`, `store_local`, `herd_space` |
 
 Semantics that v0 enforces:
@@ -121,6 +122,55 @@ Limits:
 - Each piece is split on its own. To cut across a PE's whole stack of pieces, write the owner map by hand: `{0: "t0 mod P", 1: "(t0 floordiv P) floordiv b"}`.
 - An owner table nested with a cut on another axis is refused, since `TableMap` has one piece coordinate.
 - The AIR emission of a nested map may use a guard per trip instead of a closed-form loop: correct, but not the shortest code.
+
+#### A different inner layout per piece: layout trees
+
+`nest` gives every piece the same inner layout. A `Layout` tree keeps the levels apart, so each piece can have its own, and a level can be tied to a memory (`"L2"` for a segment, `"L1"` for a herd):
+
+```python
+G4, G22 = Grid(4), Grid((2, 2))
+QUARTERS = Decomposition(Block(0, 2), Block(1, 2))
+ON_G22 = Map(G22, {0: 0, 1: 1})
+tiles = Layout(QUARTERS, ON_G22, level="L1")
+rows  = Layout(Decomposition(Block(0, 4)), Map(G4, {0: 0}), level="L1")
+
+tree = bind_tree(matrix, Layout(QUARTERS, ON_G22, level="L2", inner=tiles, overrides={(1, 1): rows}))
+tree.primary_owner((12, 12))                 # ((1, 1), (2,)): segment (1, 1), PE 2
+tree.classes()                               # 2 distinct inner layouts: what a backend pays for
+tree.fit({"L2": 512 * 1024, "L1": 64 * 1024}, element_bytes=4)   # bytes needed vs available, per level
+```
+
+- Each node is an ordinary view over its parent's piece, so any cut or mapping works at any node, at any depth. A PE is a path, one coordinate per level.
+- `inner` goes in every piece and `overrides` replaces it in the pieces it names; with no `inner`, `overrides` names them all.
+- `flatten()` turns a tree with one inner layout per level into the `nest` view, so the AIR backend takes it today. Trees with overrides are not emitted to AIR yet.
+- Limits: a PE that holds several pieces cannot have inner layouts, and `fit` counts one tensor without halos.
+
+#### How it compares
+
+Hierarchical data partitioning in other systems, from [`docs/NESTED_LAYOUTS.md`](docs/NESTED_LAYOUTS.md) (the sources are listed there; entries are our reading, so treat them as approximate).
+
+| System | Tree of levels | Levels tied to memory | Different inner layout per piece | Uneven outer pieces | Static capacity check | Owner | Local index | Inverse / gather | Generates code for |
+|---|---|---|---|---|---|---|---|---|---|
+| **distlayout** | ✅ | ⚠️ level names, read by `fit` | ✅ `overrides` | ✅ | ✅ no halos yet | ✅ | ✅ | ✅ | ⚠️ AIR for uniform trees |
+| Sequoia | ✅ | ✅ | ❌ | ✅ | ❌ | ⚠️ implicit | ⚠️ implicit | ❌ | Cell, cluster |
+| Legion | ✅ | ❌ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | Realm tasks |
+| Chapel | ⚠️ two deep | ✅ | ❌ | ⚠️ | ❌ | ✅ | ✅ | ❌ | CPU, GPU |
+| DISTAL | ✅ | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ | ⚠️ | Legion |
+| HTA | ✅ | ✅ | ✅ MATLAB form only | ✅ | ❌ | ✅ | ✅ | ⚠️ | MATLAB, C++ MPI |
+| CuTe | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | CUDA |
+| LEGO | ⚠️ | ❌ | ⚠️ opaque function | ✅ | ❌ | ✅ | ✅ | ✅ | C, CUDA |
+| Fireiron | ✅ | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | CUDA |
+| Exo | ❌ | ✅ | — | — | ❌ | — | — | — | C for accelerators |
+| Triton | ⚠️ | ✅ | ❌ | ⚠️ | ⚠️ at launch | ✅ | ✅ | ✅ | PTX |
+| Shardy / GSPMD | ❌ flat | ❌ | ❌ | ⚠️ padding | ❌ | ✅ | ✅ | ❌ | XLA |
+| Timeloop / CoSA | ✅ | ✅ | ❌ | ❌ | ✅ in a search | — | — | — | cost model only |
+| MLIR-AIR | ✅ launch / segment / herd | ✅ | ⚠️ one segment per class | ⚠️ | ⚠️ | — | — | — | AIE |
+
+✅ = yes, ❌ = no, ⚠️ = partly, — = doesn't apply.
+
+- **Legion** and **HTA** are the only ones that let sibling pieces be split differently, and neither has a layout algebra with an inverse. The algebras (**CuTe**, **LEGO**, **Shardy**) are uniform. `overrides` is how distlayout has both: a uniform default, and exceptions you can see and count.
+- **Sequoia** is the model for levels tied to memories, and **Timeloop / CoSA** for the capacity check. None of the programming models checks that a piece fits its level; `fit` does.
+- Where distlayout is behind: trees have no AIR emission yet, and `fit` ignores halos.
 
 ### Uneven layouts and halos to AIR
 
@@ -235,7 +285,7 @@ python3 examples/gallery.py          # writes docs/explorer.html, open it in a b
 
 `docs/explorer.html` is one self-contained page with no network or dependencies:
 
-- **Presets:** Block, Block + replicate, Uneven, Replicate, 2-D block, Transposed mapping, 2-D halo, Cyclic, Block-cyclic, Skew, Tile split, Rank split k=1 / k=4, Refine 1-D, Irregular: block of ids / BFS partition / renumbered (with a ④ graph view of the mesh), PartTensor-style rectangles, four nested layouts, eltwise_add.
+- **Presets:** Block, Block + replicate, Uneven, Replicate, 2-D block, Transposed mapping, 2-D halo, Cyclic, Block-cyclic, Skew, Tile split, Rank split k=1 / k=4, Refine 1-D, Irregular: block of ids / BFS partition / renumbered (with a ④ graph view of the mesh), PartTensor-style rectangles, a **4. Nested** group (`nest` and layout trees, one tree that is too big for L1), eltwise_add.
 - **Builder,** in the library's two steps. *① Decomposition layout*: per tensor axis whole / block / uneven, with a piece count; uneven axes also take explicit **sizes** (`3, 7`) or a **balanced / tail** policy. *③ Mapping layout*: per grid axis an owner expression such as `t0`, `t0 mod 4` or `(t0 + t1) mod 4` (blank = replicated). Also halo radius, bytes per element and PE memory, with errors explained inline (e.g. "sizes 3, 6 sum to 9, axis has 10").
 - **Picture, in three steps:** *① Decomposition layout*: an outline of the tensor drawn on the tensor's own grid, so its cuts line up with the tensor and can be laid on it mentally. *② Tensor*: the same cuts over the elements, colored by owner PE; hover an element for its formula. *③ Mapping layout*: each PE card names the piece(s) it got, with a memory-fit bar and red arrows for halo or ghost imports. Code tabs (Python, `#dist.layout`, `air.api`, MLIR) sit in a full-width panel below.
 - **Code tabs:** Python spec · `#dist.layout` · `air.api` herd body · MLIR (the real module, when rendered with MLIR-AIR installed).
