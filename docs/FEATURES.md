@@ -48,7 +48,11 @@ Where distlayout stands overall. This is the one list to keep current: update it
 
 | Feature | Core | Explorer | AIR |
 |---|---|---|---|
-| Any layout inside any layout (`nest`) | ✅ | ✅ | ✅ when the result is an emittable owner map |
+| One inner layout in every piece (`nest`) | ✅ | ✅ | ✅ when the result is an emittable owner map |
+| Layout tree: default inner layout, per-piece overrides, any depth (`Layout`, `bind_tree`) | ✅ | ✅ | ❌ |
+| Inner-layout classes (`classes`) | ✅ | ✅ in the notes | ❌ |
+| Per-level capacity check (`fit`, no halos yet) | ✅ | ✅ | ❌ |
+| Planning requests across a tree | ❌ | ❌ | ❌ |
 | An inner layout across a PE's whole stack of pieces | ⚠️ write the owner map by hand | ✅ | ✅ |
 | Several tensors assigned together (whole tensors as pieces) | ❌ | ❌ | ❌ |
 | Layout inside one PE (tiling, swizzle) | ❌ | ❌ | ❌ |

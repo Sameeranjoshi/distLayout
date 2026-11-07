@@ -24,6 +24,7 @@ From a `DistributedView` you can ask ownership questions, plan transfers for a r
 | `distlayout/expr.py` | quasi-affine expressions: `+ - *const floordiv mod`, `parse`, MLIR-syntax printing, `substitute` |
 | `distlayout/view.py` | `DataSource`, `DistributedView` (ownership queries, `plan`, `validate`, `to_attr`), `bind` |
 | `distlayout/layouts.py` | `cyclic`, `block_cyclic`, `skew`, `nest` (any layout inside each piece), `refine` (`nest` with one cut: owner(tx, ty)) |
+| `distlayout/tree.py` | `Layout` (a tree of layouts), `bind_tree`, `TreeView` (paths, `classes`, `fit`, `flatten`). Each node is a `DistributedView` over its parent's piece. |
 | `distlayout/irregular.py` | `CSRPattern`, `grid_graph`, `owner_array`, partitioners (`block_partition`, `random_partition`, `bfs_partition`), `renumber`, `inspect` (inspector), `rectangle_fetch`, `scatter` / `exchange` / `spmv` / `gather` (reference executor) |
 | `distlayout/backends/schedule.py` | owner-map inversion: `solve(view)` gives loop nest + recipes; `Text` for printing; per-trip guards and guarded scans |
 | `distlayout/backends/air.py` | AIR emission: `copy_kernel`, `for_each_piece`, `for_each_region` / `halo_load` / `store_owned` (size classes), `ghost_load` / `ghost_gather_kernel`, `herd_space`, `region_shape` |

@@ -14,6 +14,7 @@ from .irregular import (CSRPattern, GhostSchedule, bfs_partition, block_partitio
 from .layouts import block_cyclic, cyclic, nest, refine, skew
 from .mapping import Grid, Map, Mapping, OwnerMap, Replicate, TableMap
 from .region import Box, IndexSet
+from .tree import Fit, Layout, TreeView, bind_tree
 from .view import DataSource, DistributedView, MaterializationPlan, Transfer, bind
 
 __all__ = [
@@ -23,6 +24,7 @@ __all__ = [
     "TableMap", "owner_array", "CSRPattern", "GhostSchedule", "inspect",
     "block_partition", "random_partition", "bfs_partition", "renumber", "grid_graph",
     "scatter", "gather", "exchange", "spmv", "rectangle_fetch",
+    "Layout", "TreeView", "Fit", "bind_tree",
     "Box", "IndexSet",
     "DataSource", "DistributedView", "MaterializationPlan", "Transfer", "bind",
 ]
