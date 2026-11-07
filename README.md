@@ -289,6 +289,7 @@ python3 examples/gallery.py          # writes docs/explorer.html, open it in a b
 - **Builder,** in the library's two steps. *① Decomposition layout*: per tensor axis whole / block / uneven, with a piece count; uneven axes also take explicit **sizes** (`3, 7`) or a **balanced / tail** policy. *③ Mapping layout*: per grid axis an owner expression such as `t0`, `t0 mod 4` or `(t0 + t1) mod 4` (blank = replicated). Also halo radius, bytes per element and PE memory, with errors explained inline (e.g. "sizes 3, 6 sum to 9, axis has 10").
 - **Picture, in three steps:** *① Decomposition layout*: an outline of the tensor drawn on the tensor's own grid, so its cuts line up with the tensor and can be laid on it mentally. *② Tensor*: the same cuts over the elements, colored by owner PE; hover an element for its formula. *③ Mapping layout*: each PE card names the piece(s) it got, with a memory-fit bar and red arrows for halo or ghost imports. Code tabs (Python, `#dist.layout`, `air.api`, MLIR) sit in a full-width panel below.
 - **Code tabs:** Python spec · `#dist.layout` · `air.api` herd body · MLIR (the real module, when rendered with MLIR-AIR installed).
+- **Trees:** the left panel picks the inner layout for each outer piece, and ④ draws the tree from tensor to leaf PEs. The status line reports `fit` per level.
 - **Pin as A** to compare bytes/PE with the current layout. In *Rank split*, pin at 8 × 1, then set the grid to 8 × 4.
 - **Export SVG** of the picture.
 

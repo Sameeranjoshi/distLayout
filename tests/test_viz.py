@@ -77,20 +77,20 @@ def test_to_spec_rejects_what_it_cannot_draw():
 
 # -- the JavaScript port against Python ----------------------------------------
 
-def test_tree_spec_lists_each_leaf_piece_with_its_pe():
+def test_tree_spec_names_the_inner_layouts_and_which_piece_gets_which():
     g2 = Grid(2)
-    rows = Layout(Decomposition(Block(0, 2)), Map(g2, {0: 0}))
-    tree = bind_tree(Buf(8, 2), Layout(Decomposition(Block(0, 2)), Map(g2, {0: 0}), overrides={1: rows, 0: Layout(*cyclic(4, 2))}))
-    spec = to_spec(tree, title="t", code="tree = ...")
-    assert spec["grid"] == [2, 2]
-    assert spec["table"] == [0, 0, 1, 1, 2, 3]
-    assert spec["boxes"][0] == {"lo": [0, 0], "hi": [1, 2]}
-    assert spec["boxes"][-1] == {"lo": [6, 0], "hi": [8, 2]}
-    assert spec["outer"] == [{"lo": [0, 0], "hi": [4, 2]}, {"lo": [4, 0], "hi": [8, 2]}]
-    assert spec["code"] == "tree = ..."
+    rows = Layout(Decomposition(Block(0, 2)), Map(g2, {0: 0}), level="L1")
+    cyc = Layout(*cyclic(4, 2))
+    tree = bind_tree(Buf(8, 2), Layout(Decomposition(Block(0, 2)), Map(g2, {0: 0}), level="L2", inner=cyc, overrides={1: rows}))
+    spec = to_spec(tree, names={rows: "rows"})
+    assert spec["grid"] == [2] and spec["level"] == "L2" and spec["default"] == "inner1"
+    assert spec["inner"] == {"1": "rows"}
+    assert spec["library"]["rows"] == {"cuts": [{"axis": 0, "kind": "block", "parts": 2}], "map": ["t0"], "grid": [2],
+                                       "level": "L1", "inner": {}}
+    assert spec["library"]["inner1"]["map"] == ["t0 mod 2"]
 
 
-def test_tree_spec_rejects_replicas():
+def test_tree_spec_rejects_replicas_with_inner_layouts():
     tree = bind_tree(Buf(8), Layout(Decomposition(), Replicate(Grid(2)), inner=Layout(*cyclic(8, 2))))
     with pytest.raises(NotImplementedError, match="replica"):
         to_spec(tree)
@@ -138,14 +138,14 @@ const { chromium } = require('playwright');
   const b = await chromium.launch(); const p = await b.newPage();
   await p.goto('file://' + process.argv[2]);
   const out = await p.evaluate(() => PRESETS.map(spec => {
-    const D = window.distlayout, L = D.build(spec);
+    const D = window.distlayout, L = D.build(spec.library ? D.composeTree(spec).flat : spec);
     const all = (shape) => shape.reduce((acc, n) => acc.flatMap(a => [...Array(n).keys()].map(x => a.concat([x]))), [[]]);
     return {
       owners: all(L.shape).map(i => L.peIx(L.primaryOf(L.partOf(i)))),
       held: L.pes.map(pe => L.piecesAt(pe).map(p => { const r = L.region(p); return [r.lo, r.hi]; })),
       plans: L.pes.map(pe => { const pl = D.plan(L, pe, +spec.halo || 0);
         return pl ? pl.pieces.map(x => [[x.r.lo, x.r.hi], x.local, x.local ? null : x.src]) : null; }),
-      attr: D.attrText(L), py: D.pyText(Object.assign({}, L, { spec: Object.assign({}, spec, { src: 'SRC' }) })),
+      fit: spec.library ? D.levels(spec) : null, attr: D.attrText(L), py: D.pyText(Object.assign({}, L, { spec: Object.assign({}, spec, { src: 'SRC' }) })),
     };
   }));
   console.log(JSON.stringify(out)); await b.close();
@@ -176,6 +176,10 @@ def test_page_agrees_with_python(tmp_path):
             want = _tree_facts(view)
             assert got["owners"] == want["owners"], f"{name}: owners differ"
             assert got["held"] == want["held"], f"{name}: held regions differ"
+            assert got["fit"] == {f.level: f.needed for f in view.fit(kw["capacity"], 4)}, f"{name}: fit differs"
+            assert "bind_tree(" in got["py"] and all(n in got["py"] for n in kw["names"].values() if n in got["py"])
+            for n in kw["names"].values():
+                assert (n in got["py"]) == (f"{n} = " in got["py"]), f"{name}: {n} defined but unused, or used but undefined"
             continue
         want = _python_facts(view, kw.get("halo", 0))
         got["plans"] = [None if pl is None else sorted(pl) for pl in got["plans"]]

@@ -66,7 +66,6 @@ SHARED = """\
 G2, G4, G22 = Grid(2), Grid(4), Grid((2, 2))
 QUARTERS = Decomposition(Block(0, 2), Block(1, 2))
 ON_G22 = Map(G22, {0: 0, 1: 1})
-
 tiles = Layout(QUARTERS, ON_G22, level="L1")
 rows  = Layout(Decomposition(Block(0, 4)), Map(G4, {0: 0}), level="L1")
 cols  = Layout(Decomposition(Block(1, 4)), Map(G4, {0: 0}), level="L1")
@@ -75,14 +74,11 @@ cyc   = Layout(*cyclic(8, 4), level="L1")
 
 
 def tree_preset(name, shape, body, note):
-    """A preset whose Code tab is the code that built it, with the capacity check in its note."""
-    code = f"{SHARED}\n{body}"
+    """A tree built from SHARED + body; the page gets each inner layout under its variable name."""
     env = dict(vars(distlayout), matrix=Buf(*shape))
-    exec(code, env)
-    tree = env["tree"]
-    fits = "; ".join(f"{f.level}: fullest memory {f.needed} of {f.available} bytes"
-                     + ("" if f.fits else f", does not fit, needs a split of {f.split}") for f in tree.fit(NPU, 4))
-    return name, tree, {"code": code, "pe_kib": 64, "note": f"{note} At 4 bytes per element, {fits}."}
+    exec(SHARED + body, env)
+    names = {v: k for k, v in env.items() if isinstance(v, distlayout.Layout)}
+    return name, env["tree"], {"names": names, "capacity": NPU, "pe_kib": 64, "note": note}
 
 
 def presets():
@@ -150,19 +146,11 @@ def presets():
          {"note": "A sparse 10 × 7 matrix cut into uneven disjoint rectangles (rows 3 + 7, columns 2 + 5), one per PE. "
                   "PE 0 computes the rows of its rectangles and needs the nonzeros of those rows: " + rect_note + " "
                   "Each foreign slice is one fetch, like a PartTensor get_slice."}),
-        ("Same inside every segment", nest(bind(Buf(24), Decomposition(Block(0, 4)), Map(Grid(4), {0: 0})), *cyclic(6, 3)),
-         {"note": "nest(view, *cyclic(6, 3)): 4 segments hold a block each in L2, and each deals its 6 elements "
-                  "round-robin over its 3 PEs. The inner layout is written for one piece, in that piece's coordinates. "
-                  "nest flattens the two into one owner map: g0 = t0 floordiv 6, g1 = (t0 mod 6) mod 3."}),
-        ("Rows, then columns", nest(bind(Buf(6, 8), Decomposition(Block(0, 2)), Map(Grid(2), {0: 0})),
-                                    Decomposition(Block(1, 4)), Map(Grid(4), {0: 0})),
-         {"note": "Rows over 2 segments, then columns inside each over 4 PEs. The inner cut is on an axis the outer one "
-                  "left whole, so it adds a coordinate."}),
-        ("Replicas inside segments", nest(bind(Buf(12), Decomposition(UnevenBlock(0, sizes=[8, 4])), Map(Grid(2), {0: 0})),
-                                          Decomposition(), Replicate(Grid(3))),
-         {"note": "Each of 2 uneven segments keeps a copy of its piece on all 3 of its PEs: replication nested inside a "
-                  "partition. The first PE of each segment is the owner."}),
-        ("Blocks inside a graph partition", nest(bind(Buf(64), *owner_array(renum_owner)),
+        ("nest: cyclic inside blocks", nest(bind(Buf(24), Decomposition(Block(0, 4)), Map(Grid(4), {0: 0})), *cyclic(6, 3)),
+         {"note": "nest(view, *cyclic(6, 3)): 4 segments hold a block each, and each deals its 6 elements round-robin "
+                  "over its 3 PEs. nest flattens the two levels into one owner map: g0 = t0 floordiv 6, "
+                  "g1 = (t0 mod 6) mod 3, so the AIR backend takes it as it is."}),
+        ("nest: blocks inside a graph partition", nest(bind(Buf(64), *owner_array(renum_owner)),
                                                  Decomposition(UnevenBlock(0, parts=2)), Map(Grid(2), {0: 0})),
          {"pattern": renum_mesh, "positions": renum_pos,
           "note": "A graph partition over 4 segments, with each one's contiguous ids split over 2 PEs. The partition is "
@@ -234,8 +222,7 @@ GROUPS = {
     "Rank split k=1": AFFINE, "Rank split k=4": AFFINE, "Refine 1-D": AFFINE,
     "Irregular: block of ids": IRREGULAR, "Irregular: BFS partition": IRREGULAR,
     "Irregular: renumbered": IRREGULAR, "PartTensor-style rectangles": IRREGULAR,
-    "Same inside every segment": NESTED, "Rows, then columns": NESTED, "Replicas inside segments": NESTED,
-    "Blocks inside a graph partition": NESTED, "Tree: four different grids": NESTED, "Tree: one piece differs": NESTED,
+    "nest: cyclic inside blocks": NESTED, "nest: blocks inside a graph partition": NESTED, "Tree: four different grids": NESTED, "Tree: one piece differs": NESTED,
     "Tree: uneven pieces, different herds": NESTED, "Tree: three levels": NESTED, "Tree: too big for L1": NESTED,
 }
 

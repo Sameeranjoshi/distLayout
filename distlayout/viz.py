@@ -269,44 +269,24 @@ def _traced_code(view: DistributedView, names: List[str], src: str, dtype: str, 
 def to_spec(view: DistributedView, title: str = "", note: str = "", halo: int = 0,
             mlir: Optional[str] = None, src: str = "l2", elem_bytes: int = 4,
             pe_kib: float = 48, pattern: Any = None, positions: Optional[Sequence[Tuple[int, int]]] = None,
-            group: str = "", code: str = "") -> Dict[str, Any]:
+            group: str = "", names: Optional[Dict[Any, str]] = None,
+            capacity: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
     """The JSON the page understands. Raises for layouts the page cannot draw.
 
     Cuts are listed in tensor-axis order (as the builder shows them); owner
     expressions are renumbered to match.
     """
     if isinstance(view, TreeView):
-        return _tree_spec(view, title, note, group, code, elem_bytes, pe_kib)
+        return _tree_spec(view, title, note, group, elem_bytes, pe_kib, names, capacity)
     if len(view.shape) > 2:
         raise NotImplementedError("the explorer draws rank-1 and rank-2 tensors")
     if not view.source.is_global:
         raise NotImplementedError("the explorer draws global sources")
-    rules = list(view.decomposition.rules)
-    order = sorted(range(len(rules)), key=lambda k: rules[k].axis)
-    new_of = {old: new for new, old in enumerate(order)}
-    cuts = []
-    for k in order:
-        r = rules[k]
-        n = view.shape[r.axis]
-        if isinstance(r, Block):
-            cuts.append({"axis": r.axis, "kind": "block", "parts": r.parts})
-        elif isinstance(r, UnevenBlock):
-            c = {"axis": r.axis, "kind": "uneven", "parts": r.num_parts(n), "policy": r.policy}
-            if r.sizes_ is not None:
-                c["sizes"] = list(r.sizes_)
-            cuts.append(c)
-        else:
-            raise NotImplementedError(f"the explorer cannot draw {r!r}")
-    from .mapping import TableMap
-    table = isinstance(view.mapping, TableMap)
-    exprs = {} if table else view.mapping.exprs()
-    mapping: List[Optional[str]] = [None] * view.grid.rank
-    for g, e in exprs.items():
-        mapping[g] = str(substitute_all(e, {old: Var(new_of[old]) for old in range(len(rules))}))
+    cuts, mapping, table = _cuts_map(view)
     spec = {"title": title, "group": group, "note": note, "shape": list(view.shape), "grid": list(view.grid.shape),
             "cuts": cuts, "map": mapping, "halo": halo, "bytes": elem_bytes, "kib": pe_kib, "src": src}
-    if table:
-        spec["table"], spec["rep"] = view.mapping.linear(), list(view.mapping.replicate)
+    if table is not None:
+        spec["table"], spec["rep"] = table, list(view.mapping.replicate)
     if pattern is not None:                      # irregular access: ghosts and imports from the inspector
         from .irregular import inspect
         sched = inspect(view, pattern)
@@ -319,10 +299,36 @@ def to_spec(view: DistributedView, title: str = "", note: str = "", halo: int = 
                              "edges": [[i, j] for i in range(pattern.nrows) for j in pattern.row(i) if i < j]}
     if mlir:
         spec["mlir"] = mlir
-    if (halo or not view.is_uniform()
+    if "air" not in spec and (halo or not view.is_uniform()
             or as_placement(view.mapping, view.decomposition.num_parts(view.shape)) is None):
         spec["air"] = air_code(view, src, halo=halo)[0]
     return spec
+
+
+def _cuts_map(view: DistributedView) -> Tuple[List[Dict[str, Any]], List[Optional[str]], Optional[List[int]]]:
+    """A view's cuts in tensor-axis order, its owner expressions renumbered to match, and its table if any."""
+    rules = list(view.decomposition.rules)
+    order = sorted(range(len(rules)), key=lambda k: rules[k].axis)
+    new_of = {old: new for new, old in enumerate(order)}
+    cuts = []
+    for k in order:
+        r = rules[k]
+        if isinstance(r, Block):
+            cuts.append({"axis": r.axis, "kind": "block", "parts": r.parts})
+        elif isinstance(r, UnevenBlock):
+            c = {"axis": r.axis, "kind": "uneven", "parts": r.num_parts(view.shape[r.axis]), "policy": r.policy}
+            if r.sizes_ is not None:
+                c["sizes"] = list(r.sizes_)
+            cuts.append(c)
+        else:
+            raise NotImplementedError(f"the explorer cannot draw {r!r}")
+    from .mapping import TableMap
+    table = isinstance(view.mapping, TableMap)
+    exprs = {} if table else view.mapping.exprs()
+    mapping: List[Optional[str]] = [None] * view.grid.rank
+    for g, e in exprs.items():
+        mapping[g] = str(substitute_all(e, {old: Var(new_of[old]) for old in range(len(rules))}))
+    return cuts, mapping, view.mapping.linear() if table else None
 
 
 def tree_pes(tree: TreeView) -> Tuple[Dict[Any, int], List[int]]:
@@ -334,24 +340,49 @@ def tree_pes(tree: TreeView) -> Tuple[Dict[Any, int], List[int]]:
     return {p: r * width + c for r, row in enumerate(rows.values()) for c, p in enumerate(row)}, [len(rows), width]
 
 
-def _tree_spec(tree: TreeView, title: str, note: str, group: str, code: str, elem_bytes: int, pe_kib: float) -> Dict[str, Any]:
-    """A tree has no one cut, so the page gets its leaf boxes and draws them as the pieces."""
+def _tree_spec(tree: TreeView, title: str, note: str, group: str, elem_bytes: int, pe_kib: float,
+               names: Optional[Dict[Any, str]] = None, capacity: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+    """A tree for the page: the root as a flat spec, plus a library of named inner layouts and which piece gets which.
+
+    The page composes the tree itself, so the tree can be edited there. ``names``
+    gives each inner ``Layout`` its name in the code tab.
+    """
     if len(tree.view.shape) > 2:
         raise NotImplementedError("the explorer draws rank-1 and rank-2 tensors")
-    pes, grid = tree_pes(tree)
-    leaves = [(box, ix, path) for path, ix in pes.items() for box in tree.held_regions(path)]
-    if sum(box.volume for box, _, _ in leaves) != Box.full(tree.view.shape).volume:
-        raise NotImplementedError("the explorer cannot draw replicas in a tree yet")
-    box_json = lambda b: {"lo": list(b.offset), "hi": list(b.stop)}
-    text = "Layout trees are not emitted to AIR yet."
-    return {"title": title, "group": group, "note": note, "shape": list(tree.view.shape), "grid": grid, "cuts": [],
-            "map": [None] * len(grid), "halo": 0, "bytes": elem_bytes, "kib": pe_kib, "src": "l2", "code": code,
-            "boxes": [box_json(b) for b, _, _ in leaves], "table": [ix for _, ix, _ in leaves],
-            "paths": [" → ".join(str(pe) for pe in path) for _, _, path in leaves],
-            "outer": [box_json(tree.view.partition_region(p)) for p in tree.view.partitions()],
-            "levels": [f"outer: {len(list(tree.view.partitions()))} pieces, solid lines",
-                       f"inner: {len(tree.classes())} different layouts, dashed lines"],
-            "attr": f"# {text}", "air": f"# {text}", "mlir": f"# {text}"}
+    names = dict(names or {})
+    library: Dict[str, Dict[str, Any]] = {}
+
+    def name_of(layout) -> str:
+        if layout not in names:
+            names[layout] = f"inner{len(library) + 1}"
+        return names[layout]
+
+    def fragment(node: TreeView) -> Dict[str, Any]:
+        if node.view.max_pieces > 1 and node.children:
+            raise NotImplementedError("the explorer cannot draw a tree whose PE holds several pieces")
+        if any(len(node.view.mapping.pes_of(pid)[1]) > 1 for pid in node.view.partitions()) and node.children:
+            raise NotImplementedError("the explorer cannot draw replicas in a tree yet")
+        cuts, mapping, table = _cuts_map(node.view)
+        if table is not None:
+            raise NotImplementedError("the explorer cannot draw owner tables in a tree yet")
+        out: Dict[str, Any] = {"cuts": cuts, "map": mapping, "grid": list(node.view.grid.shape), "level": node.layout.level}
+        if node.layout.inner is not None:
+            out["default"] = register(node.layout.inner, node.children[next(iter(node.children))])
+        out["inner"] = {",".join(map(str, pid)): register(child.layout, child)
+                        for pid, child in node.children.items() if child.layout != node.layout.inner}
+        return out
+
+    def register(layout, child: TreeView) -> str:
+        name = name_of(layout)
+        if name not in library:
+            library[name] = fragment(child)
+        return name
+
+    root = fragment(tree)
+    root.update({"title": title, "group": group, "note": note, "shape": list(tree.view.shape), "halo": 0,
+                 "bytes": elem_bytes, "kib": pe_kib, "src": "matrix", "library": library,
+                 "capacity": capacity or {}})
+    return root
 
 
 def render_explorer(entries: Sequence[Tuple[str, DistributedView, Dict[str, Any]]],
@@ -416,7 +447,6 @@ svg text{font-family:Aptos,"Segoe UI",Inter,system-ui,sans-serif}
 </style></head><body><div class="wrap">
 <h1>%TITLE%</h1>
 <div class="presets" id="presets"></div>
-<p class="note" id="note"></p>
 <div class="main">
  <div class="card">
   <h2>Layout</h2>
@@ -432,7 +462,6 @@ svg text{font-family:Aptos,"Segoe UI",Inter,system-ui,sans-serif}
  <div class="card">
   <div id="pic"></div>
   <div class="formula" id="formula"></div>
-  <div class="legend" id="legend"></div>
   <div class="bar"><button class="btn" id="pin">Pin as A</button><button class="btn" id="svg">Export SVG</button><span class="stat" id="stat"></span></div>
  </div>
 </div>
@@ -476,6 +505,36 @@ function sizesOf(c,extent){const parts=c.parts;
   if((c.policy||"balanced")==="balanced"){const q=Math.floor(extent/parts),r=extent%parts;return Array.from({length:parts},(_,k)=>k<r?q+1:q)}
   const b=Math.ceil(extent/parts);let left=extent;return Array.from({length:parts},()=>{const v=Math.min(b,left);left-=v;return v})}
 function prod(lists){return lists.reduce((acc,l)=>acc.flatMap(a=>l.map(x=>a.concat([x]))),[[]])}
+// ---------- layout trees: the page composes the tree, so it can edit it ----------
+function treeNode(spec,shape,lib,depth){  // {L, pieces:[{pid,box,pe,child}]} for one node; child is a treeNode or null
+  const L=build(Object.assign({},spec,{shape,boxes:null,table:null,library:null,inner:null,default:null}));
+  const inner=spec.inner||{};
+  const pieces=L.pids.map(pid=>{const key=pid.join(","),name=key in inner?inner[key]:spec.default;
+    const hs=L.holdersOf(pid);if(hs.length>1&&name)throw new Error("a replicated piece cannot have an inner layout yet");
+    const box=L.region(pid),child=name?treeNode(lib[name],box.hi.map((h,i)=>h-box.lo[i]),lib,depth+1):null;
+    if(name&&!lib[name])throw new Error(`no layout named ${name}`);
+    return {pid,box,pe:hs[0],name,child}});
+  return {L,spec,pieces,depth};
+}
+function treeLeaves(node,off,path){  // every leaf piece: {box (global), path, level}
+  const out=[];node.pieces.forEach(p=>{const lo=p.box.lo.map((v,i)=>v+off[i]),hi=p.box.hi.map((v,i)=>v+off[i]),pth=path.concat([p.pe]);
+    if(p.child)out.push(...treeLeaves(p.child,lo,pth));else out.push({box:{lo,hi},path:pth,level:node.spec.level})});return out}
+function treeLevels(node,bytes,acc){  // per level name, the fullest PE's bytes
+  const lv=node.spec.level;if(lv){const on={};node.pieces.forEach(p=>on[p.pe.join()]=(on[p.pe.join()]||0)+vol(p.box));acc[lv]=Math.max(acc[lv]||0,...Object.values(on).map(v=>v*bytes))}
+  node.pieces.forEach(p=>p.child&&treeLevels(p.child,bytes,acc));return acc}
+function fillInner(spec){  // after an edit: drop pieces that are gone, name the new ones
+  const L=build(Object.assign({},spec,{boxes:null,table:null,library:null})),keys=L.pids.map(p=>p.join(","));
+  Object.keys(spec.inner).forEach(k=>{if(!keys.includes(k))delete spec.inner[k]});
+  if(!spec.default)keys.forEach(k=>{if(!(k in spec.inner))spec.inner[k]=Object.keys(spec.library)[0]})}
+function composeTree(spec){
+  const root=treeNode(spec,spec.shape,spec.library,0),leaves=treeLeaves(root,spec.shape.map(()=>0),[]);
+  const rows=[];const rowIx={};leaves.forEach(l=>{const k=l.path.slice(0,-1).join("/");if(!(k in rowIx)){rowIx[k]=rows.length;rows.push([])}
+    const r=rows[rowIx[k]];if(!r.some(x=>x.join()===l.path.join()))r.push(l.path)});
+  const width=Math.max(...rows.map(r=>r.length));const peOf={};rows.forEach((r,i)=>r.forEach((p,j)=>peOf[p.join()]=i*width+j));
+  const flat=Object.assign({},spec,{tree:spec,grid:[rows.length,width],cuts:[],map:[null,null],boxes:leaves.map(l=>l.box),table:leaves.map(l=>peOf[l.path.join()]),
+    paths:leaves.map(l=>l.path.map(pe=>"("+pe.join(", ")+")").join(" → ")),outer:root.pieces.map(p=>p.box)});
+  return {flat,root,leaves};
+}
 function build(spec){
   const shape=spec.shape, grid=spec.grid, rank=shape.length, G=grid.length;
   if(!rank||rank>2)throw new Error("tensor must be 1-D or 2-D");
@@ -486,7 +545,7 @@ function build(spec){
     const st=[0];sz.forEach(s=>st.push(st[st.length-1]+s));return {axis:c.axis,c,sizes:sz,starts:st}});
   const boxes=spec.boxes||null, counts=boxes?[boxes.length]:rules.map(r=>r.sizes.length), ncomp=rules.length;
   const table=spec.table||null;
-  if(boxes&&boxes.reduce((a,b)=>a+vol(b),0)!==shape.reduce((a,b)=>a*b,1))throw new Error("a layout tree is edited in Python");
+  if(boxes&&boxes.reduce((a,b)=>a+vol(b),0)!==shape.reduce((a,b)=>a*b,1))throw new Error("the tree's pieces do not cover the tensor");
   const exprs=grid.map((n,g)=>{const s=table?"":(spec.map[g]||"").trim();if(!s)return null;
     let e;try{e=parseExpr(s)}catch(err){throw new Error(`g${g}: ${err.message}`)}
     const bad=varsE(e).filter(k=>k>=ncomp);if(bad.length)throw new Error(`g${g} = ${strE(e)} uses t${bad[0]}, but pieces have ${ncomp} coordinate${ncomp===1?"":"s"}`);return e});
@@ -555,9 +614,23 @@ function mappingRepr(L){
     return `Map(${gridRepr(L.grid)}, {${L.place.map(([k,g])=>`${k}: ${g}`).join(", ")}}${rep})`}
   if(L.table)return `TableMap(${gridRepr(L.grid)}, [${L.table.join(", ")}]${rep})`;
   return `OwnerMap(${gridRepr(L.grid)}, {${L.exprs.map((e,g)=>e?`${g}: '${strE(e)}'`:null).filter(Boolean).join(", ")}}${rep})`}
-function pyText(L){return L.spec.code||`view = bind(${L.spec.src||"l2"}, Decomposition(${L.rules.map(ruleRepr).join(", ")}), ${mappingRepr(L)})`}
+function layoutRepr(entry,shape,lib,sep=" "){const L=build(Object.assign({},entry,{shape,library:null,boxes:null,table:null}));
+  const extra=(entry.level?`, level="${entry.level}"`:"")+(entry.default?`, inner=${entry.default}`:"")+
+    (Object.keys(entry.inner||{}).length?`, overrides={${Object.entries(entry.inner).map(([k,v])=>`${pyTuple(k.split(","))}: ${v}`).join(", ")}}`:"");
+  return `Layout(${sep==" "?"":sep}Decomposition(${L.rules.map(ruleRepr).join(", ")}),${sep}${mappingRepr(L)}${extra.replace(/^, /,","+sep)})`}
+function treePyText(spec){  // the library entries this tree uses, then the tree itself
+  const lib=spec.library,used=[],shapes={};const visit=(entry,shape)=>{const L=build(Object.assign({},entry,{shape,library:null,boxes:null,table:null}));
+    L.pids.forEach(pid=>{const key=pid.join(","),name=key in (entry.inner||{})?entry.inner[key]:entry.default;if(!name)return;
+      const b=L.region(pid),sh=b.hi.map((h,i)=>h-b.lo[i]);if(!used.includes(name)){used.push(name);shapes[name]=sh;visit(lib[name],sh)}})};
+  visit(spec,spec.shape);
+  return used.slice().reverse().map(n=>`${n} = ${layoutRepr(lib[n],shapes[n],lib)}`).join("\n")+(used.length?"\n\n":"")+
+    `tree = bind_tree(${spec.src||"matrix"}, ${layoutRepr(spec,spec.shape,lib,"\n    ")})`}
+function treeAttrText(T){const lines=[`# whole tensor: ${attrText(T.root.L)}`],seen={};
+  const walk=n=>n.pieces.forEach(p=>{if(!p.child||seen[p.name])return;seen[p.name]=1;lines.push(`# ${p.name}: ${attrText(p.child.L)}`);walk(p.child)});
+  walk(T.root);return lines.join("\n")}
+function pyText(L){return L.spec.library?treePyText(L.spec.tree||L.spec):`view = bind(${L.spec.src||"l2"}, Decomposition(${L.rules.map(ruleRepr).join(", ")}), ${mappingRepr(L)})`}
 function attrText(L){
-  if(L.spec.attr)return L.spec.attr;
+  if(L.spec.library&&window.__tree&&L.spec.boxes)return treeAttrText(window.__tree);
   const rr=L.rules.map(r=>r.c.kind==="block"?`block<axis = ${r.axis}, parts = ${r.sizes.length}>`:
     r.c.sizes?`uneven<axis = ${r.axis}, sizes = [${r.c.sizes.join(", ")}]>`:`uneven<axis = ${r.axis}, parts = ${r.sizes.length}, policy = ${r.c.policy||"balanced"}>`).join(", ");
   const head=`#dist.layout<shape = [${L.shape.join(", ")}], grid = [${L.grid.join(", ")}], decomp = [${rr}], `, rep=`replicate = [${L.replicate.map(g=>"g"+g).join(", ")}]>`;
@@ -565,6 +638,7 @@ function attrText(L){
   if(L.table)return head+`owner = table<[${L.table.join(", ")}]>, `+rep;
   return head+`owner = [${L.exprs.map((e,g)=>e?`g${g} = ${strE(e)}`:null).filter(Boolean).join(", ")}], `+rep}
 function airText(L){
+  if(L.spec.library)return "# A layout tree is not emitted to AIR yet. flatten() gives the nest view when every piece has the same inner layout.";
   if(L.spec.imports&&cur.air)return cur.air;          // irregular access: the ghost gather
   if(!L.placement||!L.uniform||(+L.spec.halo||0)>0)return cur.air||"# This layout is emitted with loops (owner maps) or one branch per size class\n# (uneven, halo), which the Python backend computes: air_backend.for_each_piece /\n# halo_load. python3 examples/gallery.py embeds the emitted code for each preset;\n# editing the layout here drops it.";
   const names=["tx","ty","tz"].slice(0,L.grid.length), src=L.spec.src||"l2", gOf=k=>(L.place.find(p=>p[0]===k)||[0,-1])[1];
@@ -577,11 +651,12 @@ function airText(L){
     `\n\n# with distlayout:\n#   a = air_backend.alloc_local(view, f32, scope=h.private())\n#   air_backend.load_local(view, a, (${names.join(", ")}${names.length===1?",":""}))`}
 function formula(L,idx){
   const pid=L.partOf(idx);
-  if(L.spec.paths)return `element (${idx.join(", ")}) → ${L.spec.paths[pid[0]]} → PE ${L.table[pid[0]]}`;
-  const cut=L.rules.map((r,k)=>r.c.kind==="block"?`t${k} = i${r.axis} // ${r.sizes[0]} = ${pid[k]}`:`t${k} = piece of i${r.axis} in [${brief(r.sizes)}] = ${pid[k]}`);
-  const map=L.table?[`table[${L.pidIx(pid)}] = PE ${L.table[L.pidIx(pid)]}`]:L.exprs.map((e,g)=>e?`g${g} = ${strE(e)} = ${evalE(e,pid)}`:null).filter(Boolean);
+  if(L.spec.paths)return `element (${idx.join(", ")}) is on PE ${L.table[pid[0]]}: the path ${L.spec.paths[pid[0]]}, one PE coordinate per level.`;
   const pe=L.primaryOf(pid), hs=L.holdersOf(pid);
-  return `element (${idx.join(", ")}): ${cut.join("; ")||"one piece"} → ${pname(pid)} → ${map.join("; ")||"(replicated)"} → PE ${L.peIx(pe)}`+(hs.length>1?`, held by ${hs.length} PEs`:"");
+  const cut=L.rules.map((r,k)=>r.c.kind==="block"?`t${k} = ${idx[r.axis]} // ${r.sizes[0]} = ${pid[k]}`:`t${k} = ${pid[k]} (axis ${r.axis} cut at ${brief(r.sizes)})`);
+  const map=L.table?[`table[${L.pidIx(pid)}] = ${L.table[L.pidIx(pid)]}`]:L.exprs.map((e,g)=>e?`g${g} = ${strE(e)} = ${evalE(e,pid)}`:null).filter(Boolean);
+  return `element (${idx.join(", ")}) is in piece ${pname(pid)}, held by PE ${L.peIx(pe)}`+(hs.length>1?` and ${hs.length-1} replica${hs.length>2?"s":""}`:"")+
+    `.  Piece: ${cut.join(", ")||"the whole tensor"}.  PE: ${map.join(", ")||"replicated, owner at 0"}.`;
 }
 function hint(L){return ""}
 
@@ -615,7 +690,8 @@ function draw(L){
     const fs=(r1-r0)*ch>=16?11:9.5;if((c1-c0)*cc>=lab.length*fs*0.62+4&&(r1-r0)*ch>=12)s+=`<text x="${(c0+c1)/2*cc}" y="${ty0+(r0+r1)/2*ch+fs*0.36}" font-size="${fs}" fill="${muted}" text-anchor="middle">${lab}</text>`});
   const outerLines=(x0,y0,sx,sy)=>rank<2?"":(L.spec.outer||[]).map(b=>`<rect x="${x0+b.lo[1]/sc*sx}" y="${y0+b.lo[0]/sr*sy}" width="${(b.hi[1]-b.lo[1])/sc*sx}" height="${(b.hi[0]-b.lo[0])/sr*sy}" fill="none" stroke="${ink}" stroke-width="2.4" pointer-events="none"/>`).join("");
   s+=outerLines(.5,ty0+.5,cc,ch);
-  const rulesTxt=L.spec.levels||(L.rules.length?L.rules.map((r,k)=>r.c.sizes&&r.c.sizes.length>12?`t${k}: UnevenBlock(axis=${r.axis}, ${r.c.sizes.length} runs)`:`t${k}: ${ruleRepr(r)}`):["one piece"]);
+  const T=window.__tree;
+  const rulesTxt=T?[`${T.root.pieces.length} outer pieces (solid lines)${T.root.spec.level?" in "+T.root.spec.level:""}`,`${[...new Set(T.leaves.map(l=>l.level).filter(Boolean))].join(", ")||"inner"}: ${new Set(T.root.pieces.map(p=>p.name)).size} inner layout${new Set(T.root.pieces.map(p=>p.name)).size===1?"":"s"} (dashed lines)`]:(L.rules.length?L.rules.map((r,k)=>r.c.sizes&&r.c.sizes.length>12?`t${k}: UnevenBlock(axis=${r.axis}, ${r.c.sizes.length} runs)`:`t${k}: ${ruleRepr(r)}`):["one piece"]);
   rulesTxt.forEach((t,k)=>s+=sub(0,ty0+th0+18+k*15,t));
   const tBottom=ty0+th0+18+(rulesTxt.length-1)*15;
   // ② the tensor: same cuts, colored by the owner PE of each piece; kept well apart from ①
@@ -675,15 +751,26 @@ function draw(L){
     s+=cap(0,gy-24,"④ Graph")+sub(80,gy-24,`${cutN} cut edges`)+es;
     P.forEach((_,id)=>{s+=`<circle class="el" data-i="${id}" data-o="${own[id]}" cx="${X(id)}" cy="${Y(id)}" r="${Math.max(4,sp*0.28)}" fill="${peColor(L,own[id])}" stroke="var(--bg)" stroke-width="1.2"><title>id ${id} → PE ${own[id]}</title></circle>`});
     H=gy+mx*sp+20;PW=Math.max(PW,20+my*sp)}
+  // ④ tree: the tensor, then each level's pieces, then the leaf PEs; hover a leaf to see its elements
+  if(T){const leaves=[...new Map(T.leaves.map(l=>[l.path.join(),l])).values()],nl=leaves.length,gy=H+46,cw=Math.min(90,Math.max(44,Math.floor((W-20)/nl))),depth=Math.max(...leaves.map(l=>l.path.length));
+    const rowY=d=>gy+d*54,xs={};leaves.forEach((l,i)=>xs[l.path.join()]=10+i*cw+cw/2);
+    const xOf=path=>{const ks=leaves.filter(l=>l.path.slice(0,path.length).join()===path.join());return (xs[ks[0].path.join()]+xs[ks[ks.length-1].path.join()])/2};
+    const node=(x,y,w,txt,fill,own,title)=>`<g class="${own!==null?"pe":""}" data-o="${own===null?"":own}"><rect x="${x-w/2}" y="${y-11}" width="${w}" height="22" rx="6" fill="${fill}" stroke="var(--line)"/><text x="${x}" y="${y+4}" font-size="10.5" font-weight="600" fill="${own!==null?"#fff":ink}" text-anchor="middle">${txt}</text>${title?`<title>${title}</title>`:""}</g>`;
+    s+=cap(0,gy-24,"④ Tree")+sub(60,gy-24,`a PE is a path of ${depth} coordinates`);
+    let t="";const rootX=xOf([]);t+=node(rootX,rowY(0),130,`tensor ${L.shape.join(" × ")}`,"var(--bg)",null,"");
+    const drawn={},walk=(n,path,off)=>n.pieces.forEach(p=>{const pth=path.concat([p.pe]),y=rowY(pth.length),x=xOf(pth),px=xOf(path),py=rowY(path.length);
+      t+=`<line x1="${px}" y1="${py+11}" x2="${x}" y2="${y-11}" stroke="var(--line)"/>`;
+      const lo=p.box.lo.map((v,i)=>v+off[i]),hi=p.box.hi.map((v,i)=>v+off[i]);
+      if(p.child){t+=node(x,y,Math.max(60,cw*Math.max(1,leaves.filter(l=>l.path.slice(0,pth.length).join()===pth.join()).length)-8),(()=>{const full=`${pname(p.pid)} · ${p.name}`,room=cw*leaves.filter(l=>l.path.slice(0,pth.length).join()===pth.join()).length-8;return full.length*6.2<=room?full:pname(p.pid)})(),"var(--bg)",null,`${p.name}, PE (${p.pe.join(",")}): ${rstr({lo,hi})}`);walk(p.child,pth,lo)}
+      else if(!drawn[pth.join()]){drawn[pth.join()]=1;const ix=L.table[T.leaves.findIndex(l=>l.path.join()===pth.join())];t+=node(x,y,cw-6,`PE ${ix}`,peColor(L,ix),ix,`${pth.map(pe=>"("+pe.join(",")+")").join(" → ")}: ${rstr({lo,hi})}`)}});
+    walk(T.root,[],L.shape.map(()=>0));s+=t;H=rowY(depth)+24;PW=Math.max(PW,20+nl*cw)}
   const mk=(id,d,rx)=>`<marker id="${id}" viewBox="0 0 10 10" refX="${rx}" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="${d}" fill="${id==="ahm"?"#52657B":"#D95455"}"/></marker>`;
   $("pic").innerHTML=`<div style="overflow-x:auto"><svg xmlns="http://www.w3.org/2000/svg" width="${PW}" height="${H}" viewBox="0 0 ${PW} ${H}"><defs>${mk("ah","M0,0L10,5L0,10z",8)}${mk("ah2","M10,0L0,5L10,10z",2)}${mk("ahm","M0,0L10,5L0,10z",8)}</defs>${s}${arrows}</svg></div>`;
-  // legend & stats
-  const byOwner={};L.pids.forEach(pid=>{const o=L.peIx(L.primaryOf(pid));(byOwner[o]=byOwner[o]||[]).push(pid)});
-  $("legend").innerHTML=L.prim.slice(0,12).map(o=>{const ps=byOwner[o],hs=L.holdersOf(ps[0]).length;
-    return `<span><i class="sw" style="background:${peColor(L,o)}"></i>PE ${o} ← ${ps.length<=3?ps.map(pname).join(", "):ps.length+" pieces"}${hs>1?` +${hs-1} replica${hs>2?"s":""}`:""}</span>`}).join("")+(L.prim.length>12?`<span>… ${L.prim.length-12} more</span>`:"")+(halo?`<span><i class="sw" style="background:#D95455"></i>halo import</span>`:"")+(L.spec.imports?`<span><i class="sw" style="background:#D95455"></i>ghost import (${L.spec.imports.reduce((a,x)=>a+x[2],0)} ids)</span>`:"");
   L.maxB=maxB;
   const fit=over?`<b style="color:var(--comm)">${over} PE${over>1?"s":""} over budget</b>`:`<b style="color:var(--ok)">fits</b>`;
-  $("stat").innerHTML=`max ${fmtB(maxB)} / PE of ${fmtB(budget)} · ${fit}`+(pinned?` · vs A (${pinned.name}): ${fmtB(pinned.maxB)} / PE → ${maxB<=pinned.maxB?(pinned.maxB/maxB).toFixed(2)+"× less":(maxB/pinned.maxB).toFixed(2)+"× more"}`:"");
+  const cap_=Object.assign({},L.spec.capacity||{},{L1:budget});
+  if(T)$("stat").innerHTML=Object.entries(treeLevels(T.root,bytes,{})).map(([lv,b])=>{const c=cap_[lv];return `${lv}: fullest ${fmtB(b)}`+(c?` of ${fmtB(c)} · `+(b<=c?`<b style="color:var(--ok)">fits</b>`:`<b style="color:var(--comm)">needs a split of ${Math.ceil(b/c)}</b>`):"")}).join(" &nbsp; ");
+  else  $("stat").innerHTML=`max ${fmtB(maxB)} / PE of ${fmtB(budget)} · ${fit}`+(pinned?` · vs A (${pinned.name}): ${fmtB(pinned.maxB)} / PE → ${maxB<=pinned.maxB?(pinned.maxB/maxB).toFixed(2)+"× less":(maxB/pinned.maxB).toFixed(2)+"× more"}`:"");
   const svgEl=$("pic").querySelector("svg");
   svgEl.querySelectorAll(".el").forEach(e=>{e.onmouseenter=()=>{hl(+e.dataset.o);$("formula").textContent=formula(L,e.dataset.i.split(",").map(Number))};e.onmouseleave=unhl});
   svgEl.querySelectorAll(".pe").forEach(e=>{e.onmouseenter=()=>hl(+e.dataset.o);e.onmouseleave=unhl});
@@ -695,7 +782,6 @@ function draw(L){
 // ---------- UI ----------
 function parseList(v){return v.split(/[x×,\s]+/).filter(Boolean).map(Number)}
 function syncForm(){
-  if(cur.boxes){$("cuts").innerHTML=`<label>Layout tree: ${cur.boxes.length} leaf pieces</label>`;$("maps").innerHTML=`<label>Each row of PEs is one outer piece. Edit the tree in Python.</label>`;return}
   const box=$("cuts");box.innerHTML="";
   cur.shape.forEach((n,a)=>{const c=cur.cuts.find(c=>c.axis===a),kind=c?c.kind:"whole";
     box.insertAdjacentHTML("beforeend",`<div class="row3"><div><label>Tensor axis ${a} (${n})</label><select data-a="${a}">${["whole","block","uneven"].map(k=>`<option ${k===kind?"selected":""}>${k}</option>`).join("")}</select></div>`+
@@ -717,14 +803,23 @@ function syncForm(){
   if(cur.table){mb.innerHTML=`<label>Owner table: ${cur.table.length} runs</label>`;return}
   cur.grid.forEach((n,g)=>mb.insertAdjacentHTML("beforeend",`<label>Grid axis g${g} (${n} PEs)</label><input class="mono" data-g="${g}" value="${(cur.map[g]||"").replace(/"/g,"&quot;")}" placeholder="replicated">`));
   mb.querySelectorAll("input").forEach(inp=>inp.oninput=()=>{cur.map[+inp.dataset.g]=inp.value;delete cur.mlir;delete cur.air;render()});
+  if(cur.library)innerForm();
 }
-function load(spec){cur=JSON.parse(JSON.stringify(spec));$("note").textContent=cur.note||"";$("shape").value=cur.shape.join(" × ");$("grid").value=cur.grid.join(" × ");
+function innerForm(){  // one select per outer piece: which inner layout goes inside it
+  const mb=$("maps"),names=Object.keys(cur.library);let L;try{L=build(Object.assign({},cur,{boxes:null,table:null,library:null}))}catch(e){return}
+  mb.insertAdjacentHTML("beforeend",`<h3 style="margin-top:14px">Inside each piece</h3>`);
+  L.pids.forEach(pid=>{const key=pid.join(","),v=key in cur.inner?cur.inner[key]:(cur.default||"");
+    mb.insertAdjacentHTML("beforeend",`<div class="row"><label style="align-self:center">${pname(pid)}</label><select data-pid="${key}">${names.map(n=>`<option value="${n}" ${n===v?"selected":""}>${n}</option>`).join("")}</select></div>`)});
+  mb.querySelectorAll("select[data-pid]").forEach(sel=>sel.onchange=()=>{cur.inner[sel.dataset.pid]=sel.value;render()});
+}
+function load(spec){cur=JSON.parse(JSON.stringify(spec));$("shape").value=cur.shape.join(" × ");$("grid").value=cur.grid.join(" × ");
   $("halo").value=cur.halo||0;$("bytes").value=cur.bytes||4;$("kib").value=cur.kib||48;syncForm();render()}
 function render(){
-  try{const L=build(cur);$("err").textContent="";draw(L);showCode(L);window.__last=L}
+  try{window.__tree=null;let spec=cur;if(cur.library){fillInner(cur);const T=composeTree(cur);window.__tree=T;spec=T.flat}
+    const L=build(spec);$("err").textContent="";draw(L);showCode(L);window.__last=L}
   catch(e){$("err").textContent=e.message}}
 function showCode(L){
-  const t={python:["Python",pyText(L)],attr:["#dist.layout",attrText(L)],air:["air.api",airText(L)],mlir:["MLIR",cur.mlir||"# MLIR is embedded when the page is rendered with MLIR-AIR installed\n# (python3 examples/gallery.py). Editing the layout drops it."]};
+  const t={python:["Python",pyText(L)],attr:["#dist.layout",attrText(L)],air:["air.api",airText(L)],mlir:["MLIR",L.spec.library?airText(L):cur.mlir||"# MLIR is embedded when the page is rendered with MLIR-AIR installed\n# (python3 examples/gallery.py). Editing the layout drops it."]};
   $("tabs").innerHTML=Object.entries(t).map(([k,[n]])=>`<button data-t="${k}" class="${k===tab?"on":""}">${n}</button>`).join("");
   $("tabs").querySelectorAll("button").forEach(b=>b.onclick=()=>{tab=b.dataset.t;showCode(L)});$("code").textContent=t[tab][1]}
 $("shape").onchange=()=>{cur.shape=parseList($("shape").value);cur.cuts=cur.cuts.filter(c=>c.axis<cur.shape.length).map(c=>{const d=Object.assign({},c);delete d.sizes;return d});delete cur.mlir;delete cur.air;syncForm();render()};
@@ -744,5 +839,5 @@ PRESETS.forEach((p,i)=>{const g=p.group||"";let row=rowsByGroup[g];
 if(PRESETS.length<2)P.style.display="none";
 const first=P.querySelector("button");first&&first.classList.add("on");load(PRESETS[0]);
 window.addEventListener("resize",()=>render());
-window.distlayout={build,pyText,attrText,airText,plan,parseExpr,strE};
+window.distlayout={build,composeTree,levels:s=>treeLevels(composeTree(s).root,4,{}),pyText,attrText,airText,plan,parseExpr,strE};
 </script></body></html>"""
