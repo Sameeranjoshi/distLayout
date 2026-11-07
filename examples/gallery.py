@@ -19,6 +19,7 @@ from distlayout import (Block, Decomposition, Grid, Map, OwnerMap, Replicate, Un
 from distlayout.irregular import CSRPattern  # noqa: E402
 from distlayout.irregular import grid_positions  # noqa: E402
 from distlayout.viz import render_explorer  # noqa: E402
+import distlayout  # noqa: E402
 
 
 class Buf:
@@ -56,6 +57,32 @@ def _rect_summary(view, pattern):
                      + (f"fetches {len(d['fetch'])} slice(s) from PE {', '.join(str(s[0] * 2 + s[1]) for s in src)}"
                         if d["fetch"] else "no fetch"))
     return "; ".join(parts) + "."
+
+
+NPU = {"L2": 512 * 1024, "L1": 64 * 1024}
+
+# Layouts are plain values, so a grid, cut or map is written once and shared.
+SHARED = """\
+G2, G4, G22 = Grid(2), Grid(4), Grid((2, 2))
+QUARTERS = Decomposition(Block(0, 2), Block(1, 2))
+ON_G22 = Map(G22, {0: 0, 1: 1})
+
+tiles = Layout(QUARTERS, ON_G22, level="L1")
+rows  = Layout(Decomposition(Block(0, 4)), Map(G4, {0: 0}), level="L1")
+cols  = Layout(Decomposition(Block(1, 4)), Map(G4, {0: 0}), level="L1")
+cyc   = Layout(*cyclic(8, 4), level="L1")
+"""
+
+
+def tree_preset(name, shape, body, note):
+    """A preset whose Code tab is the code that built it, with the capacity check in its note."""
+    code = f"{SHARED}\n{body}"
+    env = dict(vars(distlayout), matrix=Buf(*shape))
+    exec(code, env)
+    tree = env["tree"]
+    fits = "; ".join(f"{f.level}: fullest memory {f.needed} of {f.available} bytes"
+                     + ("" if f.fits else f", does not fit, needs a split of {f.split}") for f in tree.fit(NPU, 4))
+    return name, tree, {"code": code, "pe_kib": 64, "note": f"{note} At 4 bytes per element, {fits}."}
 
 
 def presets():
@@ -123,23 +150,51 @@ def presets():
          {"note": "A sparse 10 × 7 matrix cut into uneven disjoint rectangles (rows 3 + 7, columns 2 + 5), one per PE. "
                   "PE 0 computes the rows of its rectangles and needs the nonzeros of those rows: " + rect_note + " "
                   "Each foreign slice is one fetch, like a PartTensor get_slice."}),
-        ("Nested: cores inside ranks", nest(bind(Buf(24), Decomposition(Block(0, 4)), Map(Grid(4), {0: 0})), *cyclic(6, 3)),
-         {"note": "nest(view, *cyclic(6, 3)): 4 ranks hold a block each, and each rank deals its 6 elements round-robin "
-                  "over its 3 cores. The inner layout is written for one rank, in that rank's coordinates; the result "
-                  "is one owner map, g0 = t0 floordiv 6, g1 = (t0 mod 6) mod 3."}),
-        ("Nested: two levels of a model", nest(bind(Buf(6, 8), Decomposition(Block(0, 2)), Map(Grid(2), {0: 0})),
-                                               Decomposition(Block(1, 4)), Map(Grid(4), {0: 0})),
-         {"note": "Rows over 2 groups (say, data-parallel), then columns inside each group over 4 PEs (model-parallel). "
-                  "The inner cut is on an axis the outer one left whole, so it adds a coordinate."}),
-        ("Nested: replicas inside ranks", nest(bind(Buf(12), Decomposition(UnevenBlock(0, sizes=[8, 4])), Map(Grid(2), {0: 0})),
-                                               Decomposition(), Replicate(Grid(3))),
-         {"note": "Each of 2 uneven ranks keeps a copy of its piece on all 3 of its cores: replication nested inside a "
-                  "partition. The first core of each rank is the owner."}),
-        ("Nested: blocks inside a graph partition", nest(bind(Buf(64), *owner_array(renum_owner)),
-                                                         Decomposition(UnevenBlock(0, parts=2)), Map(Grid(2), {0: 0})),
+        ("Same inside every segment", nest(bind(Buf(24), Decomposition(Block(0, 4)), Map(Grid(4), {0: 0})), *cyclic(6, 3)),
+         {"note": "nest(view, *cyclic(6, 3)): 4 segments hold a block each in L2, and each deals its 6 elements "
+                  "round-robin over its 3 PEs. The inner layout is written for one piece, in that piece's coordinates. "
+                  "nest flattens the two into one owner map: g0 = t0 floordiv 6, g1 = (t0 mod 6) mod 3."}),
+        ("Rows, then columns", nest(bind(Buf(6, 8), Decomposition(Block(0, 2)), Map(Grid(2), {0: 0})),
+                                    Decomposition(Block(1, 4)), Map(Grid(4), {0: 0})),
+         {"note": "Rows over 2 segments, then columns inside each over 4 PEs. The inner cut is on an axis the outer one "
+                  "left whole, so it adds a coordinate."}),
+        ("Replicas inside segments", nest(bind(Buf(12), Decomposition(UnevenBlock(0, sizes=[8, 4])), Map(Grid(2), {0: 0})),
+                                          Decomposition(), Replicate(Grid(3))),
+         {"note": "Each of 2 uneven segments keeps a copy of its piece on all 3 of its PEs: replication nested inside a "
+                  "partition. The first PE of each segment is the owner."}),
+        ("Blocks inside a graph partition", nest(bind(Buf(64), *owner_array(renum_owner)),
+                                                 Decomposition(UnevenBlock(0, parts=2)), Map(Grid(2), {0: 0})),
          {"pattern": renum_mesh, "positions": renum_pos,
-          "note": "A graph partition over 4 ranks, with each rank's contiguous ids split over 2 cores. The partition is "
+          "note": "A graph partition over 4 segments, with each one's contiguous ids split over 2 PEs. The partition is "
                   "still a table, so nesting gives a table, and ghosts come from the same inspector."}),
+        tree_preset("Tree: four different grids", (16, 16),
+                    """tree = bind_tree(matrix, Layout(QUARTERS, ON_G22, level="L2", overrides={
+    (0, 0): tiles, (0, 1): rows, (1, 0): cols, (1, 1): cyc}))""",
+                    "A 16 × 16 matrix in four 8 × 8 pieces, one per segment (L3 to L2), each split its own way over its 4 "
+                    "PEs (L2 to L1). Each row of PE cards is one segment. nest cannot express this."),
+        tree_preset("Tree: one piece differs", (16, 16),
+                    """tree = bind_tree(matrix, Layout(QUARTERS, ON_G22, level="L2", inner=tiles,
+                                 overrides={(1, 1): rows}))""",
+                    "tiles in every piece, except the one named in overrides. Only the exceptions are written, and "
+                    "classes() reports 2 inner layouts, which is what a backend pays for."),
+        tree_preset("Tree: uneven pieces, different herds", (16, 4),
+                    """small = Layout(Decomposition(Block(0, 2)), Map(G2, {0: 0}), level="L1")
+large = Layout(Decomposition(Block(0, 5)), Map(Grid(5), {0: 0}), level="L1")
+tree = bind_tree(matrix, Layout(Decomposition(UnevenBlock(0, sizes=[6, 10])), Map(G2, {0: 0}),
+                                level="L2", overrides={0: small, 1: large}))""",
+                    "Two segments of different sizes, with herds of 2 and 5 PEs. Empty cards are only padding in the "
+                    "drawing."),
+        tree_preset("Tree: three levels", (16, 16),
+                    """in_two = Layout(Decomposition(Block(1, 2)), Map(G2, {0: 0}), level="L1")
+middle = Layout(Decomposition(Block(0, 2)), Map(G2, {0: 0}), inner=in_two)
+tree = bind_tree(matrix, Layout(QUARTERS, ON_G22, level="L2", inner=middle))""",
+                    "Trees have no depth limit: inner layouts contain inner layouts. A PE is a path of three "
+                    "coordinates, shown when you hover an element."),
+        tree_preset("Tree: too big for L1", (300, 300),
+                    """half = Layout(Decomposition(Block(1, 2)), Map(G2, {0: 0}), level="L1")
+tree = bind_tree(matrix, Layout(Decomposition(Block(0, 2)), Map(G2, {0: 0}), level="L2", inner=half))""",
+                    "The L2 pieces fit, but each PE needs 90,000 bytes of 64 KiB. fit() reports it before any code "
+                    "is generated, along with the fewest parts that would fit."),
         ("eltwise_add", bind(Buf(n), Decomposition(Block(0, n // tile)), Map(Grid(n // tile), {0: 0})),
          {"src": "l2_a", "mlir": eltwise_mlir(n, tile),
           "note": f"Upstream eltwise_add_with_l2, n = {n}, tile = {tile}: one block per herd point. The MLIR tab "
@@ -171,7 +226,7 @@ def ghost_mlir(view, pattern):
 STRUCTURED = "1. Structured tensor sharding"
 AFFINE = "2. Structured affine owner maps"
 IRREGULAR = "3. Irregular partitions"
-NESTED = "Any of these inside another"
+NESTED = "4. Nested"
 GROUPS = {
     "Block": STRUCTURED, "Block + replicate": STRUCTURED, "Uneven": STRUCTURED, "Replicate": STRUCTURED,
     "2-D block": STRUCTURED, "Transposed mapping": STRUCTURED, "2-D halo": STRUCTURED, "eltwise_add": STRUCTURED,
@@ -179,8 +234,9 @@ GROUPS = {
     "Rank split k=1": AFFINE, "Rank split k=4": AFFINE, "Refine 1-D": AFFINE,
     "Irregular: block of ids": IRREGULAR, "Irregular: BFS partition": IRREGULAR,
     "Irregular: renumbered": IRREGULAR, "PartTensor-style rectangles": IRREGULAR,
-    "Nested: cores inside ranks": NESTED, "Nested: two levels of a model": NESTED,
-    "Nested: replicas inside ranks": NESTED, "Nested: blocks inside a graph partition": NESTED,
+    "Same inside every segment": NESTED, "Rows, then columns": NESTED, "Replicas inside segments": NESTED,
+    "Blocks inside a graph partition": NESTED, "Tree: four different grids": NESTED, "Tree: one piece differs": NESTED,
+    "Tree: uneven pieces, different herds": NESTED, "Tree: three levels": NESTED, "Tree: too big for L1": NESTED,
 }
 
 
@@ -190,7 +246,7 @@ def main(out):
     entries = []
     for name, view, kw in presets():
         view.validate()
-        if "mlir" not in kw:
+        if "mlir" not in kw and not isinstance(view, distlayout.TreeView):
             kw["mlir"] = ghost_mlir(view, kw["pattern"]) if "pattern" in kw else copy_mlir(view, kw.get("halo", 0))
         kw["group"] = GROUPS[name]
         entries.append((name, view, {k: v for k, v in kw.items() if v is not None}))

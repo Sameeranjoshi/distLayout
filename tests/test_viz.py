@@ -16,8 +16,9 @@ from pathlib import Path
 
 import pytest
 
-from distlayout import Block, Box, Decomposition, Grid, Map, Replicate, UnevenBlock, bind
-from distlayout.viz import air_code, render_explorer, render_html, spec_code, to_spec
+from distlayout import (Block, Box, Decomposition, Grid, Layout, Map, Replicate, TreeView, UnevenBlock, bind, bind_tree,
+                        cyclic)
+from distlayout.viz import air_code, render_explorer, render_html, spec_code, to_spec, tree_pes
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -75,6 +76,34 @@ def test_to_spec_rejects_what_it_cannot_draw():
 
 
 # -- the JavaScript port against Python ----------------------------------------
+
+def test_tree_spec_lists_each_leaf_piece_with_its_pe():
+    g2 = Grid(2)
+    rows = Layout(Decomposition(Block(0, 2)), Map(g2, {0: 0}))
+    tree = bind_tree(Buf(8, 2), Layout(Decomposition(Block(0, 2)), Map(g2, {0: 0}), overrides={1: rows, 0: Layout(*cyclic(4, 2))}))
+    spec = to_spec(tree, title="t", code="tree = ...")
+    assert spec["grid"] == [2, 2]
+    assert spec["table"] == [0, 0, 1, 1, 2, 3]
+    assert spec["boxes"][0] == {"lo": [0, 0], "hi": [1, 2]}
+    assert spec["boxes"][-1] == {"lo": [6, 0], "hi": [8, 2]}
+    assert spec["outer"] == [{"lo": [0, 0], "hi": [4, 2]}, {"lo": [4, 0], "hi": [8, 2]}]
+    assert spec["code"] == "tree = ..."
+
+
+def test_tree_spec_rejects_replicas():
+    tree = bind_tree(Buf(8), Layout(Decomposition(), Replicate(Grid(2)), inner=Layout(*cyclic(8, 2))))
+    with pytest.raises(NotImplementedError, match="replica"):
+        to_spec(tree)
+
+
+def _tree_facts(tree):
+    pes, grid = tree_pes(tree)
+    owners = [pes[tree.primary_owner(i)] for i in Box.full(tree.view.shape).indices()]
+    held = [[] for _ in range(grid[0] * grid[1])]
+    for path, ix in pes.items():
+        held[ix] = [_box(r) for r in tree.held_regions(path)]
+    return {"owners": owners, "held": held}
+
 
 def _python_facts(view, halo):
     owners = [_pe_ix(view, view.primary_owner(i)) for i in Box.full(view.shape).indices()]
@@ -143,6 +172,11 @@ def test_page_agrees_with_python(tmp_path):
     js = json.loads(res.stdout)
     assert len(js) == len(entries)
     for (name, view, kw), got in zip(entries, js):
+        if isinstance(view, TreeView):
+            want = _tree_facts(view)
+            assert got["owners"] == want["owners"], f"{name}: owners differ"
+            assert got["held"] == want["held"], f"{name}: held regions differ"
+            continue
         want = _python_facts(view, kw.get("halo", 0))
         got["plans"] = [None if pl is None else sorted(pl) for pl in got["plans"]]
         for key in ("owners", "held", "attr", "py"):
